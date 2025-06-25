@@ -1,0 +1,3616 @@
+----- ./__init__.py -----
+__all__ = []          # <-- add this line once
+
+from .bl.extract import extract_boundary_layer, BLResult
+__all__.extend(["extract_boundary_layer", "BLResult"])
+
+----- ./parser/__init__.py -----
+
+----- ./parser/__pycache__/surface.cpython-312.pyc -----
+
+----- ./parser/__pycache__/parse_felineseg_surface.cpython-312.pyc -----
+
+----- ./parser/__pycache__/__init__.cpython-312.pyc -----
+
+----- ./parser/parse_felineseg_surface.py -----
+
+import pandas as pd
+import re
+
+def parse_felineseg_surface(filepath):
+    """
+    Parses a Tecplot ASCII file with ZONETYPE=FELINESEG and returns:
+    - DataFrame of node data
+    - List of connectivity elements (start_idx, end_idx)
+    """
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    var_line = next(i for i, line in enumerate(lines) if "VARIABLES" in line)
+    var_names = re.findall(r'"(.*?)"', lines[var_line])
+
+    zone_line = next(i for i, line in enumerate(lines) if "ZONE" in line and "FELINESEG" in line)
+    zone_info = lines[zone_line]
+
+    n_nodes = int(re.search(r'NODES\s*=\s*(\d+)', zone_info).group(1))
+    n_elems = int(re.search(r'ELEMENTS\s*=\s*(\d+)', zone_info).group(1))
+
+    node_data_start = zone_line + 1
+    node_data = [
+        list(map(float, lines[i].strip().split()))
+        for i in range(node_data_start, node_data_start + n_nodes)
+    ]
+    df = pd.DataFrame(node_data, columns=var_names)
+
+    element_data = [
+        tuple(int(i) - 1 for i in lines[i].strip().split())  # convert to 0-based
+        for i in range(node_data_start + n_nodes, node_data_start + n_nodes + n_elems)
+    ]
+
+    return df, element_data
+
+----- ./parser/surface.py -----
+import pandas as pd
+import re
+
+def parse_surface_file(filepath):
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+
+    for i, line in enumerate(lines):
+        if 'VARIABLES' in line:
+            header_line = line
+            start_idx = i + 1
+            break
+
+    header = re.findall(r'"(.*?)"', header_line)
+    
+    data_lines = []
+    for line in lines[start_idx:]:
+        if re.match(r'^[\s\d\.\-Ee+]+$', line):  # numeric line
+            data_lines.append(line)
+
+    data = [list(map(float, l.strip().split())) for l in data_lines if l.strip()]
+    df = pd.DataFrame(data, columns=header)
+    return df
+
+
+----- ./__pycache__/__main__.cpython-312.pyc -----
+
+----- ./__pycache__/__init__.cpython-312.pyc -----
+
+----- ./output.txt -----
+
+----- ./bl/io.py -----
+"""
+Very small I/O helpers for boundary-layer *.dat* tables.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+__all__ = [
+    "write_bl_table",
+    "read_bl_table",
+    "scan_bl_dir_by_prefix",
+]
+
+_HEADER = 'VARIABLES = "x","value"\nZONE T="Boundary-Layer Data"\n'
+
+
+
+
+def write_bl_table(path: Path, x, v):
+    """Write two-column Tecplot file compatible with BL7 output."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "w") as f:
+        f.write(_HEADER)
+        for xv, vv in zip(np.asarray(x, float).ravel(),
+                          np.asarray(v, float).ravel()):
+            f.write(f"{float(xv):.6e} {float(vv):.6e}\n")
+
+
+def read_bl_table(path: Path) -> pd.DataFrame:
+    """Return *clean* dataframe or empty if unreadable."""
+    try:
+        df = pd.read_csv(path, delim_whitespace=True, comment="#",
+                         names=["x", "y"], header=None, skiprows=2)
+        return df.dropna()
+    except Exception:
+        return pd.DataFrame(columns=["x", "y"])
+
+
+def scan_bl_dir_by_prefix(directory: Path):
+    """
+    Collect every BL-*.dat* file in *directory* and return a mapping:
+
+    ``{"delta": {filename: DataFrame, …},
+       "deltastar": { … }, … }``
+    """
+    kinds = ["delta", "deltastar", "theta", "h", "ue", "me"]
+    out   = {k: {} for k in kinds}
+
+    for f in Path(directory).glob("*.dat"):
+        stem = f.stem.lower()
+        for k in kinds:
+            if stem.startswith(k):
+                df = read_bl_table(f)
+                if not df.empty:
+                    out[k][stem] = df
+    return out
+
+----- ./bl/helpers.py -----
+"""
+Helper functions for boundary-layer analysis: smoothing, edge detection, and integration.
+"""
+import numpy as np
+from scipy.signal import savgol_filter
+from scipy.interpolate import NearestNDInterpolator
+from scipy.optimize import brentq
+
+
+def smooth_data(data: np.ndarray, window_length: int = 11, polyorder: int = 3) -> np.ndarray:
+    """
+    Smooth a 1D array using the Savitzky-Golay filter.
+
+    Parameters:
+    - data: input array
+    - window_length: must be odd, <= len(data)
+    - polyorder: polynomial order
+
+    Returns:
+    - smoothed array (same length)
+    """
+    if len(data) < window_length or window_length < polyorder + 2:
+        return data
+    if window_length % 2 == 0:
+        window_length += 1
+    return savgol_filter(data, window_length, polyorder)
+
+
+def compute_edge_velocity_thickness(
+    surface_pt: np.ndarray,
+    normal: np.ndarray,
+    points: np.ndarray,
+    V_mag: np.ndarray,
+    threshold: float = 0.99,
+    step_size: float = 1e-7,
+    max_distance: float = 0.5
+) -> tuple[float, float]:
+    """
+    Find BL thickness via edge-velocity method (u = threshold * u_e).
+    Returns (delta, U_e) or (nan, nan).
+    """
+    interp = NearestNDInterpolator(points, V_mag)
+    def f(s):
+        u_s = interp(surface_pt + normal * s)
+        u_next = interp(surface_pt + normal * (s + step_size))
+        if np.isnan(u_s) or np.isnan(u_next):
+            return np.nan
+        return u_s - threshold * u_next
+    try:
+        a, b = 0.0, max_distance
+        fa, fb = f(a), f(b)
+        if np.isnan(fa) or np.isnan(fb) or fa * fb > 0:
+            return np.nan, np.nan
+        s_root = brentq(f, a, b)
+        Ue = interp(surface_pt + normal * s_root)
+        return s_root, Ue
+    except Exception:
+        return np.nan, np.nan
+
+
+def compute_vorticity_thickness(
+    surface_pt: np.ndarray,
+    normal: np.ndarray,
+    points: np.ndarray,
+    vort: np.ndarray,
+    v0: float,
+    threshold_ratio: float = 1e-4,
+    step_size: float = 1e-7,
+    max_steps: int = 1000000
+) -> tuple[float, float]:
+    """
+    Find BL thickness via vorticity decay method.
+    Returns (delta, U_e) or (nan, nan).
+    """
+    interp_vort = NearestNDInterpolator(points, vort)
+    interp_vel = NearestNDInterpolator(points, vort)  # reuse vort points for velocity? user replaces
+    s = 0.0
+    for i in range(int(max_steps)):
+        s += step_size
+        v_val = interp_vort(surface_pt + normal * s)
+        if np.isnan(v_val) or np.isnan(v0):
+            break
+        if abs(v_val / v0) <= threshold_ratio:
+            Ue = interp_vel(surface_pt + normal * s)
+            return s, Ue
+    return np.nan, np.nan
+
+
+def integrate_thickness(
+    surface_pt: np.ndarray,
+    normal: np.ndarray,
+    vel_interp: NearestNDInterpolator,
+    Ue: float,
+    delta: float,
+    num_steps: int = 1000
+) -> tuple[float, float]:
+    """
+    Compute displacement and momentum thicknesses over [0, delta].
+    Returns (delta_star, theta).
+    """
+    s_vals = np.linspace(0, delta, num_steps)
+    u_vals = vel_interp(surface_pt + np.outer(s_vals, normal))
+    u_vals = np.nan_to_num(u_vals)
+    u_ratio = u_vals / (Ue if Ue != 0 else 1)
+    disp = np.trapz(1 - u_ratio, s_vals)
+    mom = np.trapz(u_ratio * (1 - u_ratio), s_vals)
+    return disp, mom
+
+----- ./bl/bl_layer.py -----
+"""
+Boundary-layer analysis module for SU2 postprocessing.
+Provides thickness, displacement, momentum, shape-factor, edge-velocity
+and velocity-profile extraction at specified x-locations.
+"""
+import os
+import numpy as np
+from scipy.spatial import KDTree
+from scipy.interpolate import NearestNDInterpolator
+from joblib import Parallel, delayed
+
+from .utils.bl_helpers import (
+    smooth_data,
+    compute_edge_velocity_thickness,
+    compute_vorticity_thickness,
+    integrate_thickness
+)
+
+class BoundaryLayerAnalyzer:
+    def __init__(
+        self,
+        flow_data: dict,
+        surface_nodes: np.ndarray,
+        surface_normals: np.ndarray,
+        x_locations: list[float],
+        methods: list[str] = ['edge_velocity'],
+        output_dir: str = 'bl_output',
+        n_jobs: int = -1
+    ):
+        self.flow_data = flow_data
+        self.surface_nodes = surface_nodes[:, :2]
+        self.surface_normals = surface_normals
+        self.x_locations = x_locations
+        self.methods = methods
+        self.output_dir = output_dir
+        self.n_jobs = n_jobs
+
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.bl = {}  # {method: np.ndarray}
+        self.disp = {}
+        self.mom = {}
+        self.H = {}
+        self.Ue = {}
+        self.velocity_profiles = {x: [] for x in x_locations}
+
+    def compute_thicknesses(self):
+        pts = np.column_stack((self.flow_data['x'], self.flow_data['y']))
+        Ux, Uy = self.flow_data['Velocity_x'], self.flow_data['Velocity_y']
+        Vmag = np.hypot(Ux, Uy)
+        vort = self.flow_data.get('Vorticity', None)
+
+        valid = ~np.isnan(Vmag)
+        pts, Vmag = pts[valid], Vmag[valid]
+        if vort is not None:
+            vort = vort[valid]
+
+        def process_node(i_pt, pt, normal):
+            out = {}
+            for m in self.methods:
+                if m == 'edge_velocity':
+                    delta, Ue = compute_edge_velocity_thickness(pt, normal, pts, Vmag)
+                elif m == 'vorticity_threshold' and vort is not None:
+                    v0 = vort[i_pt]
+                    delta, Ue = compute_vorticity_thickness(pt, normal, pts, vort, v0)
+                else:
+                    delta, Ue = np.nan, np.nan
+                if np.isnan(delta):
+                    out[m] = (np.nan, np.nan, np.nan, np.nan, np.nan)
+                else:
+                    interp = NearestNDInterpolator(pts, Vmag)
+                    d, t = integrate_thickness(pt, normal, interp, Ue, delta)
+                    H = (d/t if t != 0 else np.nan)
+                    out[m] = (delta, d, t, H, Ue)
+            return i_pt, out
+
+        args = [(i, pt, n) for i, (pt, n) in enumerate(zip(self.surface_nodes, self.surface_normals))]
+        results = Parallel(n_jobs=self.n_jobs)(delayed(process_node)(*a) for a in args)
+        for m in self.methods:
+            self.bl[m] = np.full(len(self.surface_nodes), np.nan)
+            self.disp[m] = np.full(len(self.surface_nodes), np.nan)
+            self.mom[m] = np.full(len(self.surface_nodes), np.nan)
+            self.H[m] = np.full(len(self.surface_nodes), np.nan)
+            self.Ue[m] = np.full(len(self.surface_nodes), np.nan)
+        for i, out in results:
+            for m, vals in out.items():
+                self.bl[m][i], self.disp[m][i], self.mom[m][i], self.H[m][i], self.Ue[m][i] = vals
+
+    def extract_velocity_profiles(self, num_points: int = 100, smoothing: bool = True, window_length: int = 11, polyorder: int = 3):
+        pts = np.column_stack((self.flow_data['x'], self.flow_data['y']))
+        Ux, Uy = self.flow_data['Velocity_x'], self.flow_data['Velocity_y']
+        Vmag = np.hypot(Ux, Uy)
+        interp = NearestNDInterpolator(pts, Vmag)
+
+        for x_loc in self.x_locations:
+            idx = np.abs(self.surface_nodes[:, 0] - x_loc).argmin()
+            delta = self.bl['edge_velocity'][idx]
+            Ue = self.Ue['edge_velocity'][idx]
+            if np.isnan(delta) or np.isnan(Ue) or Ue == 0:
+                continue
+            normal = self.surface_normals[idx]
+            s_vals = np.linspace(0, delta, num_points)
+            pos = self.surface_nodes[idx] + np.outer(s_vals, normal)
+            vel = interp(pos)
+            valid = ~np.isnan(vel)
+            s_vals, vel = s_vals[valid], vel[valid]
+            u_norm = vel / Ue
+            s_norm = s_vals / delta
+            if smoothing:
+                u_norm = smooth_data(u_norm, window_length, polyorder)
+            self.velocity_profiles[x_loc].append((s_norm, u_norm))
+
+    def save_bl_data(self):
+        """Save BL quantities to .dat files"""
+        xcoords = self.surface_nodes[:, 0]
+        for m in self.methods:
+            for name, arr in [('delta', self.bl[m]),
+                              ('deltaStar', self.disp[m]),
+                              ('theta', self.mom[m]),
+                              ('H', self.H[m]),
+                              ('ue', self.Ue[m])]:
+                fname = f"bl_{name}_{m}.dat"
+                with open(os.path.join(self.output_dir, fname), 'w') as f:
+                    f.write('VARIABLES = "x", "value"\n')
+                    f.write(f'ZONE T="BL {name} ({m})"\n')
+                    for x, v in zip(xcoords, arr):
+                        f.write(f'{x:.6f} {v:.6e}\n')
+
+
+    def run(self):
+        self.compute_thicknesses()
+        self.extract_velocity_profiles()
+        self.save_bl_data()
+
+----- ./bl/__pycache__/extract_new.cpython-312.pyc -----
+
+----- ./bl/__pycache__/io.cpython-312.pyc -----
+
+----- ./bl/__pycache__/plots.cpython-312.pyc -----
+
+----- ./bl/__pycache__/extract.cpython-312.pyc -----
+
+----- ./bl/plots.py -----
+"""
+Boundary-layer plotting (single & multi-case).
+Matches visual style of plot_cp_cf_it_multi.
+"""
+from __future__ import annotations
+import matplotlib.pyplot as plt
+import numpy as np
+from su2_postprocess.utils.smoothing import moving_average_1d, savgol_1d_safe
+
+
+def plot_bl_params_multi(bl_results, labels,
+                         *,  # keyword-only
+                         show_H=True,
+                         show_Me=False,
+                         legends=True,
+                         smooth_window=5):
+    """δ, δ*, θ, H, uₑ (and optionally Mₑ) vs x for many cases."""
+    fig, ax = plt.subplots(figsize=(6, 4))
+    for res, lab in zip(bl_results, labels):
+        x = res.x
+        δ = moving_average_1d(res.delta["vorticity_threshold"], smooth_window)
+        δs = moving_average_1d(res.delta_star["vorticity_threshold"], smooth_window)
+        θ = moving_average_1d(res.theta["vorticity_threshold"], smooth_window)
+        ax.plot(x, δ,  label=f"δ ({lab})",  lw=.8)
+        ax.plot(x, δs, label=f"δ* ({lab})", lw=.8, ls="--")
+        ax.plot(x, θ,  label=f"θ ({lab})",  lw=.8, ls=":")
+        if show_H:
+            H = moving_average_1d(res.H["vorticity_threshold"], smooth_window)
+            ax.plot(x, H, label=f"H ({lab})", lw=.8, ls="-.")
+
+        if show_Me and res.M_e_LM is not None:
+            Me = savgol_1d_safe(res.M_e["vorticity_threshold"])
+            ax.plot(x, Me, label=f"Mₑ ({lab})", lw=.8)
+            ax.plot(x, res.M_e_LM, label=f"LM_Mach_e ({lab})", lw=.8, ls="--")
+
+    ax.set_xlabel("x/c")
+    ax.set_ylabel("value")
+    ax.grid(True, ls=":", lw=.4, alpha=.2)
+    if legends:
+        ax.legend(fontsize=8, ncol=2)
+    return fig
+
+
+def plot_velocity_profiles_multi(bl_results, labels, *, legends=True):
+    """Grid of u/uₑ vs y/δ for the stored profiles in each BLResult."""
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for res, lab in zip(bl_results, labels):
+        for prof in res.velocity_profiles.values():
+            for p in prof:
+                ax.plot(p["u_normalized"], p["s_normalized"], lw=.6, label=lab)
+    ax.set_xlabel("u/uₑ")
+    ax.set_ylabel("s/δ")
+    if legends:
+        ax.legend(fontsize=8)
+    ax.grid(True, ls=":", lw=.4, alpha=.2)
+    ax.set_aspect("equal")
+    return fig
+
+----- ./bl/extract_new.py -----
+
+"""
+Boundary-layer extraction — using surface and volume data.
+Last updated: 2025-06-23
+"""
+
+from __future__ import annotations
+from scipy.spatial import cKDTree
+
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+import numpy as np
+from joblib import Parallel, delayed
+from scipy.interpolate import NearestNDInterpolator
+from scipy.optimize import brentq
+from scipy.spatial import cKDTree
+
+from su2_postprocess.utils.smoothing import savgol_1d_safe  # noqa: F401 (used in CLI if smoothing enabled)
+
+EdgeMethod = Literal["vorticity_threshold", "edge_velocity", "gradient"]
+
+__all__ = ["BLResult", "extract_boundary_layer"]
+
+
+@dataclass
+class BLResult:
+    x: np.ndarray
+    delta: dict[str, np.ndarray]
+    delta_star: dict[str, np.ndarray]
+    theta: dict[str, np.ndarray]
+    H: dict[str, np.ndarray]
+    u_e: dict[str, np.ndarray]
+    M_e: dict[str, np.ndarray]
+    velocity_profiles: Optional[list[tuple[float, np.ndarray, np.ndarray]]] = None
+
+
+def _vorticity_threshold(y: np.ndarray, u: np.ndarray, vort: np.ndarray) -> Optional[float]:
+    if len(y) < 3 or np.isnan(vort).any():
+        return None
+    threshold = 0.01 * np.max(np.abs(vort))
+    idx = np.where(np.abs(vort) < threshold)[0]
+    return y[idx[0]] if len(idx) > 0 else None
+
+
+def _edge_velocity(y: np.ndarray, u: np.ndarray, **_) -> Optional[float]:
+    if len(y) < 2:
+        return None
+    ue = np.max(u)
+    frac = 0.99
+    idx = np.where(u > frac * ue)[0]
+    return y[idx[0]] if len(idx) > 0 else None
+
+
+def _gradient_edge(y: np.ndarray, u: np.ndarray, **_) -> Optional[float]:
+    if len(y) < 5:
+        return None
+    grad = np.gradient(u, y)
+    grad_mag = np.abs(grad)
+    idx = np.argmin(grad_mag)
+    return y[idx]
+
+
+EDGE_METHOD_FUNCS = {
+    "vorticity_threshold": _vorticity_threshold,
+    "edge_velocity": _edge_velocity,
+    "gradient": _gradient_edge,
+}
+
+
+def _integrate_displacement_thickness(y: np.ndarray, u: np.ndarray, ue: float) -> float:
+    return np.trapz(1.0 - u / ue, x=y)
+
+
+def _integrate_momentum_thickness(y: np.ndarray, u: np.ndarray, ue: float) -> float:
+    return np.trapz((u / ue) * (1.0 - u / ue), x=y)
+
+
+def extract_boundary_layer(
+    surface_nodes: np.ndarray,
+    surface_normals: np.ndarray,
+    volume_points: np.ndarray,
+    vel_mag: np.ndarray,
+    vorticity: np.ndarray,
+    mach_field: Optional[np.ndarray],
+    gamma: float,
+    methods: tuple[str, ...],
+    n_jobs: int = 1,
+) -> BLResult:
+
+    tree = cKDTree(volume_points)
+    r_max = 0.05  # max radius for profile
+    n_pts = 100   # samples per profile
+
+    def _node_worker(i: int):
+        pt = surface_nodes[i]
+        nrm = surface_normals[i]
+
+        arc = np.linspace(0, r_max, n_pts)
+        probe = pt + arc[:, None] * nrm[None, :]
+
+        dist, idx = tree.query(probe, k=1)
+        u = vel_mag[idx]
+        vort = vorticity[idx] if vorticity is not None else np.full_like(u, np.nan)
+        M = mach_field[idx] if mach_field is not None else None
+
+        ue = np.max(u)
+        Me = np.nanmax(M) if M is not None else ue * np.sqrt((gamma - 1) / (1 + 0.5 * (gamma - 1) * ue**2))
+
+        profile_data = {
+            "y": arc,
+            "u": u,
+            "vort": vort,
+        }
+
+        delta_dict = {}
+        delta_star_dict = {}
+        theta_dict = {}
+        H_dict = {}
+        u_e_dict = {}
+        M_e_dict = {}
+
+        for m in methods:
+            edge_fn = EDGE_METHOD_FUNCS.get(m)
+            if edge_fn is None:
+                continue
+
+            try:
+                delta = edge_fn(**profile_data)
+                if delta is None or delta <= 0:
+                    raise ValueError("Invalid delta")
+
+                y_clip = arc[arc <= delta]
+                u_clip = u[: len(y_clip)]
+
+                d_star = _integrate_displacement_thickness(y_clip, u_clip, ue)
+                theta = _integrate_momentum_thickness(y_clip, u_clip, ue)
+                H = d_star / theta if theta > 0 else np.nan
+
+                delta_dict[m] = delta
+                delta_star_dict[m] = d_star
+                theta_dict[m] = theta
+                H_dict[m] = H
+                u_e_dict[m] = ue
+                M_e_dict[m] = Me
+
+            except Exception:
+                delta_dict[m] = np.nan
+                delta_star_dict[m] = np.nan
+                theta_dict[m] = np.nan
+                H_dict[m] = np.nan
+                u_e_dict[m] = ue
+                M_e_dict[m] = Me
+
+        return surface_nodes[i, 0], delta_dict, delta_star_dict, theta_dict, H_dict, u_e_dict, M_e_dict, arc, u
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_node_worker)(i) for i in range(len(surface_nodes))
+    )
+
+    x_vals = []
+    delta = {m: [] for m in methods}
+    delta_star = {m: [] for m in methods}
+    theta = {m: [] for m in methods}
+    H = {m: [] for m in methods}
+    u_e = {m: [] for m in methods}
+    M_e = {m: [] for m in methods}
+    profiles = []
+
+    for x, d, d_star, t, h, ue, me, y_prof, u_prof in results:
+        x_vals.append(x)
+        for m in methods:
+            delta[m].append(d.get(m, np.nan))
+            delta_star[m].append(d_star.get(m, np.nan))
+            theta[m].append(t.get(m, np.nan))
+            H[m].append(h.get(m, np.nan))
+            u_e[m].append(ue.get(m, np.nan))
+            M_e[m].append(me.get(m, np.nan))
+        profiles.append((x, y_prof, u_prof))
+
+    return BLResult(
+        x=np.array(x_vals),
+        delta={m: np.array(delta[m]) for m in methods},
+        delta_star={m: np.array(delta_star[m]) for m in methods},
+        theta={m: np.array(theta[m]) for m in methods},
+        H={m: np.array(H[m]) for m in methods},
+        u_e={m: np.array(u_e[m]) for m in methods},
+        M_e={m: np.array(M_e[m]) for m in methods},
+        velocity_profiles=profiles,
+    )
+
+----- ./bl/extract.py -----
+"""
+Boundary-layer extraction core for *su2_postprocess*.
+
+* 100 % functionality of the original **BL7.py**
+* Clean API callable from CLI or notebooks
+* Edge–finding methods: ``vorticity_threshold`` (default), ``edge_velocity``,
+  and ``gradient``
+* γ (ratio of specific heats) is passed in by the caller (parsed from the log)
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Iterable, Literal, Optional
+
+import numpy as np
+from joblib import Parallel, delayed
+from scipy.interpolate import NearestNDInterpolator
+from scipy.optimize import brentq
+
+from su2_postprocess.utils.smoothing import savgol_1d_safe
+
+
+
+EdgeMethod = Literal["vorticity_threshold", "edge_velocity", "gradient"]
+
+
+@dataclass
+class BLResult:
+    """Container returned by :func:`extract_boundary_layer`."""
+
+    x: np.ndarray
+    y: np.ndarray
+
+    delta: dict[str, np.ndarray]
+    delta_star: dict[str, np.ndarray]
+    theta: dict[str, np.ndarray]
+    H: dict[str, np.ndarray]
+    u_e: dict[str, np.ndarray]
+    M_e: dict[str, np.ndarray]
+
+    M_e_LM: Optional[np.ndarray] = None          # SU2’s own edge-Mach if present
+    velocity_profiles: dict | None = None        # filled only on demand
+
+    @property
+    def has_LM_Mach_e(self) -> bool:
+        return self.M_e_LM is not None
+
+
+
+
+def _integrate_profiles(u_norm: np.ndarray,
+                        s_norm: np.ndarray) -> tuple[float, float]:
+    """Return (δ*, θ) from normalised velocity/distance vectors."""
+    disp = np.trapz(1.0 - u_norm, s_norm)
+    mom  = np.trapz(u_norm * (1.0 - u_norm), s_norm)
+    return disp, mom
+
+
+def _edge_by_gradient(u_vals: np.ndarray,
+                      s_vals: np.ndarray,
+                      window: int = 5) -> float:
+    """Edge = first point where |∂u/∂s| < 1 % of max(|∂u/∂s|)."""
+    if len(u_vals) < window + 2:
+        return np.nan
+    du        = np.gradient(u_vals, s_vals)
+    du_smooth = savgol_1d_safe(du, window_length=window, polyorder=2)
+    thresh    = 0.01 * np.nanmax(np.abs(du_smooth))
+    idx       = np.where(np.abs(du_smooth) < thresh)[0]
+    return s_vals[idx[0]] if idx.size else np.nan
+
+
+
+
+def _node_worker(
+    idx: int,
+    surf_pt: np.ndarray,
+    normal: np.ndarray,
+    points: np.ndarray,
+    vel_mag: np.ndarray,
+    mach_field: Optional[np.ndarray],
+    vorticity: Optional[np.ndarray],
+    methods: tuple[EdgeMethod, ...],
+    gamma: float,
+    *,
+    u_ratio_edge: float = 0.99,
+    w_ratio_edge: float = 1e-4,
+    s_max: float = 5e-4,
+    n_samples: int = 600,
+    step_size: float = 1e-6,
+):
+
+    vi = NearestNDInterpolator(points, vel_mag)
+    mi = (NearestNDInterpolator(points, mach_field)
+          if mach_field is not None else None)
+
+    if vorticity is None:
+        vorticity = np.zeros_like(vel_mag)
+    wi = NearestNDInterpolator(points, vorticity)
+
+    out_delta, out_delta_star, out_theta, out_H, out_u_e, out_M_e = (
+        defaultdict(lambda: np.nan) for _ in range(6)
+    )
+
+    s_grid   = np.linspace(0.0, s_max, n_samples)
+    pts_grid = surf_pt + np.outer(s_grid, normal)
+    u_grid   = vi(pts_grid)
+    w_grid   = wi(pts_grid)
+    M_grid   = (mi(pts_grid) if mi is not None
+                else np.full_like(u_grid, np.nan))
+
+    for method in methods:
+        s_edge = np.nan
+        U_e    = np.nan
+
+        if method == "edge_velocity":
+
+            def f(s):
+                v_here = vi(surf_pt + normal * s)
+                v_next = vi(surf_pt + normal * (s + step_size))
+                if np.isnan(v_here) or np.isnan(v_next):
+                    return 1e6          # keeps brentq inside bounds
+                return v_here - u_ratio_edge * v_next
+
+            try:
+                s_edge = brentq(f, 0.0, s_max)
+                U_e    = vi(surf_pt + normal * s_edge)
+            except ValueError:
+                pass
+
+        elif method == "vorticity_threshold":
+            omega_wall = wi(surf_pt)
+            if np.isfinite(omega_wall) and omega_wall != 0.0:
+                ratio = np.abs(w_grid / omega_wall)
+                hit   = np.where(ratio <= w_ratio_edge)[0]
+                if hit.size:
+                    s_edge = s_grid[hit[0]]
+                    U_e    = u_grid[hit[0]]
+
+        elif method == "gradient":
+            s_edge = _edge_by_gradient(u_grid, s_grid)
+            if np.isfinite(s_edge):
+                U_e = vi(surf_pt + normal * s_edge)
+
+        out_delta[method] = s_edge
+        out_u_e[method]   = U_e
+
+        if not np.isfinite(s_edge) or U_e <= 0.0:
+            continue
+
+        idx_e      = np.searchsorted(s_grid, s_edge)
+        u_profile  = u_grid[: idx_e + 1] / U_e
+        s_profile  = s_grid[: idx_e + 1] / s_edge
+        d_star, th = _integrate_profiles(u_profile, s_profile)
+
+        out_delta_star[method] = d_star * s_edge
+        out_theta[method]      = th * s_edge
+        out_H[method]          = d_star / th if th > 0 else np.nan
+        out_M_e[method]        = M_grid[idx_e]
+
+    return (idx, out_delta, out_delta_star, out_theta,
+            out_H, out_u_e, out_M_e)
+
+
+
+
+def extract_boundary_layer(
+    *,
+    surface_nodes: np.ndarray,
+    surface_normals: Optional[np.ndarray],
+    volume_points: np.ndarray,
+    vel_mag: np.ndarray,
+    vorticity: Optional[np.ndarray] = None,
+    mach_field: Optional[np.ndarray] = None,
+    gamma: float = 1.4,
+    methods: Iterable[EdgeMethod] = ("vorticity_threshold",),
+    n_jobs: int = -1,
+) -> BLResult:
+    """
+    Compute δ, δ*, θ, H, uₑ, Mₑ for every surface node.
+
+    All *arrays* must be **NumPy float64** and 2-D/1-D exactly as documented
+    in the README (§ Developer API).
+    """
+
+    methods = tuple(methods)
+
+    if surface_normals is None:
+        tang   = np.diff(surface_nodes, axis=0, append=surface_nodes[-1:])
+        normals= np.column_stack([-tang[:, 1], tang[:, 0]])
+        nrm    = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals= np.divide(normals, np.where(nrm == 0, 1.0, nrm))
+        surface_normals = normals
+
+    args_iter = (
+        (i, surface_nodes[i], surface_normals[i], volume_points,
+         vel_mag, mach_field, vorticity, methods, gamma)
+        for i in range(len(surface_nodes))
+    )
+
+    results = Parallel(n_jobs=n_jobs, verbose=0)(
+        delayed(_node_worker)(*args) for args in args_iter
+    )
+
+    results = [r for r in results if isinstance(r[0], (int, np.integer))]
+    if not results:
+        raise RuntimeError("No boundary-layer points were computed; "
+                           "check surface/volume data integrity.")
+    results.sort(key=lambda t: t[0])
+
+    def collect(pos: int) -> dict[str, np.ndarray]:
+        return {m: np.array([r[pos].get(m, np.nan) for r in results])
+                for m in methods}
+
+    return BLResult(
+        x   = surface_nodes[:, 0],
+        y   = surface_nodes[:, 1],
+        delta      = collect(1),
+        delta_star = collect(2),
+        theta      = collect(3),
+        H          = collect(4),
+        u_e        = collect(5),
+        M_e        = collect(6),
+    )
+
+----- ./io/__init__.py -----
+
+----- ./io/output.py -----
+from pathlib import Path
+
+def save_plot(fig, directory, name, format=['svg','png'], dpi=300):
+    """
+    Save a matplotlib figure to the specified directory with given format and DPI.
+    """
+    directory = Path(directory) / "plots"
+    directory.mkdir(parents=True, exist_ok=True)
+
+    filename = directory / f"{name}.{format}"
+    fig.savefig(filename, dpi=dpi, format=format, bbox_inches="tight")
+    print(f"[INFO] Saved: {filename}")
+
+
+
+
+
+----- ./io/__pycache__/__init__.cpython-312.pyc -----
+
+----- ./io/__pycache__/output.cpython-312.pyc -----
+
+----- ./io/__pycache__/file_scan.cpython-312.pyc -----
+
+----- ./io/file_scan.py -----
+
+from pathlib import Path
+
+def find_case_dirs(root):
+    root = Path(root)
+    return list(root.rglob('flow_surf_.dat'))
+
+----- ./utils/__init__.py -----
+
+----- ./utils/parse_metadata.py -----
+import re
+import numpy as np
+from pathlib import Path
+import matplotlib as mpl
+mpl.rcParams['text.usetex'] = True
+mpl.rcParams['font.family'] = 'serif'
+
+TURB_ALIASES = {
+    "spalart-allmaras-noft2": r"SA-noft2",
+    "spalart allmaras": r"SA",
+    "menter's sst": r"$k\!$ - $\!\omega$ $\mathrm{SST}\!$ - $\!\mathrm{v2003m}$",
+    "menter's k-omega sst-2003m": r"$k\!$ - $\!\omega$ $\mathrm{SST}\!$ - $\!\mathrm{v2003m}$",
+    "k-omega": "k-w",
+    "k-epsilon": "k-e",
+    "none": "None",
+    "unknown": "Unknown",
+}
+
+TRANS_ALIASES = {
+    "langtry and menter's 4 equation model (2009)": {
+        "standard": r"$\gamma\!$ - $\!Re_{\theta}\!$ - $\!\mathrm{LM2009}$",
+        "cc": r"$\gamma\!$ - $\!Re_{\theta}\!$ - $\!\mathrm{LM2009}_{\mathit{cc}}$",
+    },
+    "langtry and menter's transition (2009)": r"$\gamma\!$ - $\!Re_{\theta}\!$ - $\!\mathrm{LM2009}$",
+    "langtry and menter": r"$\gamma\!$ - $\!Re_{\theta}\!$ - $\!\mathrm{LM2009}$",
+    "medida and baeder": "MB",
+    "medida-baeder": "MB",
+    "malan et al.": "Malan 2009",
+    "none": "None",
+}
+
+CORRELATION_ALIASES = {
+    "menter and langtry": " (Langtry-Menter Correlation)",
+    "medida and baeder": " (Medida-Baeder Correlation)",
+    "malan et al.": " (Malan Correlation)",
+}
+
+
+def apply_alias(model_str, alias_map):
+    if not model_str:
+        return "Unknown"
+    normalized = " ".join(model_str.strip().lower().split())
+    for key, alias in alias_map.items():
+        if key in normalized:
+            return alias
+    return model_str.strip()
+
+
+def get_transition_label(base_model, compressibility=False):
+    normalized = " ".join(base_model.strip().lower().split())
+    match = TRANS_ALIASES.get(normalized)
+    if isinstance(match, dict):
+        return match["cc"] if compressibility else match["standard"]
+    for key, alias in TRANS_ALIASES.items():
+        if key in normalized:
+            return alias["cc"] if compressibility and isinstance(alias, dict) else (
+                alias["standard"] if isinstance(alias, dict) else alias)
+    return base_model.strip()
+
+def flow_metadata_text(meta: dict, fields: list[str] = None) -> str:
+    """Return multi-line TeX-formatted string of metadata. Fields is a whitelist."""
+    if fields is None:
+        fields = ["turbulence_model", "transition_model", "correlation_model", "reynolds", "tu", "mach", "alpha"]
+
+    lines = []
+    if "turbulence_model" in fields and meta.get("turbulence_model"):
+        lines.append(meta["turbulence_model"])
+    if "transition_model" in fields and meta.get("transition_model"):
+        lines.append(meta["transition_model"])
+    if "correlation_model" in fields and meta.get("correlation_model"):
+        lines.append(meta["correlation_model"])
+    if "reynolds" in fields:
+        lines.append(
+            rf"$\mathrm{{Re}}_\infty = {meta['reynolds']/1e6:.1f}\!\!\times\!\!10^6$"
+            if meta.get("reynolds") else "Re unavailable")
+    if "tu" in fields:
+        lines.append(
+            rf"$\mathrm{{Tu}}_\%$ = {meta['tu']:.3f}\%" if meta.get("tu") is not None else "Tu unavailable")
+    if "mach" in fields:
+        lines.append(
+            rf"$\mathrm{{M}}_\infty = {meta['mach']:.2f}$" if meta.get("mach") is not None else "Mach unavailable")
+    if "alpha" in fields:
+        lines.append(
+            rf"$\alpha = {meta['alpha']:.3f}^{{\circ}}$" if meta.get("alpha") is not None else "AoA unavailable")
+
+    return "\n".join(lines)
+
+
+def extract_case_metadata_from_log(log_file, minimal=False, return_metadata=False, fields=None):
+    try:
+        turb_model, trans_model, corr_model = "Unknown", "None", None
+        mach, re_val, aoa, fsti_p = None, None, None, None
+        gamma_val = None                  
+        compressibility_flag = False
+
+        with open(log_file, "r") as f:
+            lines = list(f)
+            for i, line in enumerate(lines):
+                line_l = line.lower()
+
+                if "turbulence model:" in line_l:
+                    turb_model = line.split(":", 1)[1].strip()
+                elif "transition model:" in line_l:
+                    trans_model = line.split(":", 1)[1].strip()
+                    for j in range(1, 4):
+                        if i + j < len(lines) and "compressibility" in lines[i + j].lower():
+                            compressibility_flag = True
+                            break
+                elif "correlation functions:" in line_l:
+                    corr_model = line.split(":", 1)[1].strip()
+                elif "mach number:" in line_l:
+                    m = re.search(r"mach number:\s*([\d.]+)", line, re.I)
+                    if m:
+                        mach = float(m.group(1).rstrip('.'))
+                elif "angle of attack" in line_l:
+                    m = re.search(r"aoa\):\s*([-\d.]+)", line, re.I)
+                    if m:
+                        aoa = float(m.group(1).rstrip('.'))
+                elif "reynolds number:" in line_l:
+                    m = re.search(r"reynolds number:\s*([\deE.+-]+)", line, re.I)
+                    if m:
+                        re_val = float(m.group(1).rstrip('.'))
+                elif "turb. kin. energy" in line_l and "non-dim" not in line_l:
+                    try:
+                        parts = [p.strip() for p in line.strip().split("|") if p.strip()]
+                        if len(parts) >= 5:
+                            val = float(parts[-1])
+                            fsti_p = 100 * np.sqrt(2 / 3 * val)
+                    except Exception:
+                        pass
+                elif "ratio of specific heats" in line_l or "specific heat ratio" in line_l:
+                    m = re.search(r"([0-9.]+)", line)
+                    if m:
+                        gamma_val = float(m.group(1))
+
+        short_turb = apply_alias(turb_model, TURB_ALIASES)
+        short_trans = get_transition_label(trans_model, compressibility_flag)
+        short_corr = apply_alias(corr_model, CORRELATION_ALIASES) if corr_model else None
+
+        meta = {
+            "mach": mach,
+            "reynolds": re_val,
+            "alpha": aoa,
+            "tu": fsti_p,
+            "gamma": gamma_val,  
+            "transition_model": short_trans,
+            "turbulence_model": short_turb,
+            "compressibility": compressibility_flag,
+            "correlation_model": short_corr,
+        }
+
+        if minimal:
+            return Path(log_file).parent.name
+        elif return_metadata:
+            return flow_metadata_text(meta, fields), meta
+        else:
+            return flow_metadata_text(meta, fields)
+
+    except Exception as e:
+        print(f"[ERROR] Could not parse log: {log_file} → {e}")
+        if return_metadata:
+            return "Unknown", {}
+        return "Unknown"
+
+def extract_case_metadata_fallback(forces_file, minimal=False, return_metadata=False, fields=None):
+    forces_path = Path(forces_file)
+    parent_dir = forces_path.parent
+
+    if not forces_path.name.startswith("forces_bdwn_"):
+        print(f"[ERROR] Invalid forces file: {forces_path.name}. Must start with 'forces_bdwn_'.")
+        label = "Metadata unavailable"
+        meta = {
+            "mach": None,
+            "reynolds": None,
+            "alpha": None,
+            "tu": None,
+            "transition_model": None,
+            "turbulence_model": None,
+            "compressibility": None,
+            "correlation_model": None,
+        }
+        return (label, meta) if return_metadata else label
+
+    log_files = list(parent_dir.glob("log_*.log"))
+    if log_files:
+        log_file = max(log_files, key=lambda p: p.stat().st_mtime)
+        print(f"[INFO] Using metadata from: {log_file}")
+        return extract_case_metadata_from_log(
+            log_file, minimal=minimal, return_metadata=return_metadata, fields=fields
+        )
+
+    print(f"[WARN] No log_*.log file found in {parent_dir}")
+    return extract_case_metadata_from_forces(forces_file, minimal=minimal, return_metadata=return_metadata, fields=fields)
+
+
+def extract_case_metadata_from_forces(forces_file, minimal=False, return_metadata=False, fields=None):
+    try:
+        turb_model  = "Unknown"
+        trans_model = "None"
+        mach        = "?"
+        re_val      = "?"
+        aoa         = "?"
+        fsti        = "?"
+        fsti_p      = "?"
+
+        with open(forces_file, "r") as f:
+            for line in f:
+                if "Turbulence model:" in line:
+                    turb_model = line.split(":", 1)[1].strip()
+                elif "Transition model:" in line:
+                    trans_model = line.split(":", 1)[1].strip()
+                elif "Mach number" in line:
+                    m = re.search(r"Mach number:\s*([\d.]+)", line)
+                    if m:
+                        mach = m.group(1).rstrip(".")
+                elif "Angle of attack" in line:
+                    m = re.search(r"AoA\):\s*([-\d.]+)", line)
+                    if m:
+                        aoa = m.group(1)
+                elif "Reynolds number" in line:
+                    m = re.search(r"Reynolds number:\s*([\deE.+-]+)", line)
+                    if m:
+                        cleaned = m.group(1).rstrip(".")
+                        re_val = f"{float(cleaned):.1f}"
+                elif "Free-stream turb. kinetic energy (non-dim):" in line:
+                    m = re.search(r"Free-stream turb\. kinetic energy \(non-dim\):\s*([\deE.+-]+)", line)
+                    if m:
+                        try:
+                            fsti = float(m.group(1).rstrip("."))
+                            fsti_p = f"{100 * np.sqrt(2 / 3 * fsti):.3f}"
+                        except ValueError:
+                            fsti = "?"
+                            fsti_p = "?"
+
+        def apply_alias(model_str, alias_map):
+            model_str = model_str.lower()
+            for key, alias in alias_map.items():
+                if key.lower() in model_str:
+                    return alias
+            return model_str.strip()
+
+        short_turb = apply_alias(turb_model, TURB_ALIASES)
+        short_trans = apply_alias(trans_model, TRANS_ALIASES)
+
+        meta = {
+            "mach": float(mach) if mach != "?" else None,
+            "reynolds": float(re_val) * 1e6 if re_val != "?" else None,
+            "alpha": float(aoa) if aoa != "?" else None,
+            "tu": float(fsti_p) if fsti_p != "?" else None,
+            "transition_model": short_trans,
+            "turbulence_model": short_turb,
+            "compressibility": False,
+            "correlation_model": None,
+        }
+
+        if minimal:
+            return Path(forces_file).parent.name
+        elif return_metadata:
+            return flow_metadata_text(meta, fields), meta
+        else:
+            return flow_metadata_text(meta, fields)
+
+    except Exception as e:
+        print("Error in extract_case_metadata_from_forces:", e)
+        if return_metadata:
+            return "Metadata unavailable", {
+                "mach": None,
+                "reynolds": None,
+                "alpha": None,
+                "tu": None,
+                "transition_model": None,
+                "turbulence_model": None,
+                "compressibility": None,
+                "correlation_model": None,
+            }
+        return "Metadata unavailable"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+
+
+
+
+
+
+
+
+
+----- ./utils/__pycache__/overlay_loader.cpython-312.pyc -----
+
+----- ./utils/__pycache__/parse_metadata.cpython-312.pyc -----
+
+----- ./utils/__pycache__/__init__.cpython-312.pyc -----
+
+----- ./utils/__pycache__/label_helpers.cpython-312.pyc -----
+
+----- ./utils/__pycache__/path_helpers.cpython-312.pyc -----
+
+----- ./utils/__pycache__/plot_helpers.cpython-312.pyc -----
+
+----- ./utils/__pycache__/reorder.cpython-312.pyc -----
+
+----- ./utils/__pycache__/parse_forces.cpython-312.pyc -----
+
+----- ./utils/__pycache__/smoothing.cpython-312.pyc -----
+
+----- ./utils/smoothing.py -----
+"""
+Light-weight 1-D smoothing helpers shared by BL / Cp / Cf utilities
+-------------------------------------------------------------------
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+import numpy as np
+from scipy.signal import savgol_filter
+
+__all__ = [
+    "savgol_1d_safe",
+    "moving_average_1d",
+]
+
+
+
+def savgol_1d_safe(arr,
+                   *,
+                   window_length: int = 5,
+                   polyorder: int = 2):
+    """
+    Apply a Savitzky–Golay filter *only* when there are enough finite samples.
+
+    If not, the input array is returned unchanged.
+    """
+    arr = np.asarray(arr, dtype=float)
+    if np.count_nonzero(np.isfinite(arr)) < window_length:
+        return arr
+    if window_length % 2 == 0:
+        window_length += 1
+    return savgol_filter(arr, window_length, polyorder, mode="interp")
+
+
+
+
+def moving_average_1d(arr: np.ndarray,
+                      window: int = 5,
+                      *,
+                      nan_policy: Literal["interp", "ignore"] = "interp"
+                      ) -> np.ndarray:
+    """
+    Centred moving average with two flavours of NaN handling.
+
+    * **interp**  – interpolate NaNs first, then average (default)  
+    * **ignore**  – compute average of *valid* samples inside each window
+                   (equivalent to ``np.nanmean``); returns NaN where the
+                   entire window is NaN.
+    """
+    arr = np.asarray(arr, dtype=float)
+    n   = arr.size
+    if window < 3 or window > n:
+        return arr.copy()
+
+    if nan_policy not in {"interp", "ignore"}:
+        raise ValueError("nan_policy must be 'interp' or 'ignore'")
+
+    if np.isnan(arr).any():
+        if nan_policy == "interp":
+            valid = ~np.isnan(arr)
+            if not valid.any():
+                return arr.copy()
+            arr = np.interp(np.arange(n), np.flatnonzero(valid), arr[valid])
+
+    pad     = window // 2
+    kernel  = np.ones(window)
+
+    if nan_policy == "ignore":
+        valid        = ~np.isnan(arr)
+        padded_vals  = np.pad(np.where(valid, arr, 0.0), pad, mode="edge")
+        padded_mask  = np.pad(valid.astype(float), pad, mode="edge")
+        num          = np.convolve(padded_vals, kernel, mode="valid")
+        den          = np.convolve(padded_mask, kernel, mode="valid")
+        out          = num / den
+        out[den == 0.0] = np.nan
+        return out
+
+    padded = np.pad(arr, pad, mode="edge")
+    return np.convolve(padded, kernel / window, mode="valid")
+
+----- ./utils/overlay_loader.py -----
+
+from pathlib import Path
+import pandas as pd
+
+from pathlib import Path
+import pandas as pd
+
+def load_overlay_file(path: Path) -> pd.DataFrame:
+    """
+    Read the first two numeric columns of any .dat file, skip comments,
+    and return a DataFrame with columns ['x','y'], filtered to 0<=x<=1
+    and sorted by x.
+    """
+    try:
+        df = pd.read_csv(
+            path,
+            sep=r'\s+',
+            comment='#',
+            header=None,
+            usecols=[0, 1],
+            engine='python'
+        )
+        df.columns = ['x', 'y']
+
+        df = df.dropna(subset=['x','y'])
+
+        df = df[(df['x'] >= 0.0) & (df['x'] <= 1.0)]
+
+        df = df.sort_values('x').reset_index(drop=True)
+
+        return df
+
+    except Exception as e:
+        print(f"[WARN] Failed to load overlay {path.name}: {e}")
+        return pd.DataFrame(columns=['x', 'y'])
+
+
+
+def load_overlay_dir_by_prefix(directory: Path):
+    """
+    Scan `directory` for *.dat files whose stem *starts* with 'cp_' or 'cf_' (case-insensitive).
+    Returns two dicts (cp_dict, cf_dict), keyed by lower-case file-stem.
+    """
+    cp_dict, cf_dict = {}, {}
+    if not directory or not directory.exists():
+        print("Does not exist")
+        return cp_dict, cf_dict
+
+    for file in sorted(directory.glob("*.dat")):
+        stem = file.stem.lower()
+        if stem.startswith("cp_"):
+            print("cp")
+            df = load_overlay_file(file)
+            if not df.empty:
+                cp_dict[stem] = df
+        elif stem.startswith("cf_"):
+            print("cf")
+            df = load_overlay_file(file)
+            if not df.empty:
+                cf_dict[stem] = df
+
+    return cp_dict, cf_dict
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+----- ./utils/reorder.py -----
+import numpy as np
+import pandas as pd
+
+def reorder_surface_nodes_from_elements(df, elements, zone_type='FELINESEG'):
+    """
+    Reorders surface nodes using element connectivity (FELINESEG).
+    Arguments:
+    ----------
+    df : pd.DataFrame
+        DataFrame with surface node coordinates (must have 'x', 'y')
+    elements : list of (int, int)
+        Connectivity list, each element is a 2-tuple of node indices
+    zone_type : str
+        Zone type (must be 'FELINESEG' for now)
+
+    Returns:
+    --------
+    reordered_df : pd.DataFrame
+        Node data reordered according to element connectivity
+    """
+    if len(elements) == 0 or zone_type != 'FELINESEG':
+        return df.reset_index(drop=True)
+
+    coords = df[['x', 'y']].to_numpy()
+    start_node = elements[0][0]
+    ordered_nodes = [start_node]
+    current_node = start_node
+
+    while len(ordered_nodes) < len(coords):
+        found = False
+        for elem in elements:
+            if current_node in elem:
+                next_node = elem[1] if elem[0] == current_node else elem[0]
+                if next_node not in ordered_nodes:
+                    ordered_nodes.append(next_node)
+                    current_node = next_node
+                    found = True
+                    break
+        if not found:
+            break  # Stop early if stuck
+
+    reordered_df = df.iloc[ordered_nodes].reset_index(drop=True)
+    return reordered_df
+
+
+----- ./utils/label_helpers.py -----
+import matplotlib as mpl
+
+USE_TEX = bool(mpl.rcParams.get("text.usetex", False))
+
+def legend_label(meta: dict, style: str, case_name: str, n_cases: int) -> str:
+    turb  = meta.get("turbulence_model", "???")
+    trans = meta.get("transition_model", "???")
+    correl = meta.get("correlation_model", "???")
+
+    if style == "short":
+        return f"{turb}-{trans}{correl}"
+
+    if style == "full":
+        if USE_TEX:
+            return (f"{turb}-{trans}"
+                    rf"_M{meta['mach']:.2f}"
+                    rf"_Re{int(meta['reynolds']/1e6)}\times10^6"
+                    rf"_\alpha{meta['alpha']:.3f}^{{\\circ}}")
+        else:
+            return (f"{turb}-{trans}"
+                    f"_M{meta['mach']:.2f}"
+                    f"_Re{int(meta['reynolds']/1e6)}e6"
+                    f"_α{meta['alpha']:.1f}°")
+
+    if style == "metadata":
+        return flow_metadata_text(meta).replace("\n", r"\\")  # rarely used
+
+    if style == "auto":
+        if n_cases > 0:
+            return f"{turb}-{trans}"
+        return flow_metadata_text(meta, one_line=True)
+
+    if style == "sense":
+        grid_lvl = f"$_{{L_{n_cases-1}}}$" 
+        return rf"{turb}-{trans}{grid_lvl}"
+    
+    else:
+        print('ERROR')
+        
+    return case_name
+
+
+def flow_metadata_text(meta: dict, *, one_line: bool = False) -> str:
+    """Return Re, M, α (and Tu if present) formatted for either TeX or Unicode.
+
+    one_line=True → comma-separated single line (for legend ‘auto’ case)
+    """
+    if USE_TEX:
+        parts = [
+            rf"$\mathrm{{Re}}_\infty = {int(meta['reynolds']/1e6)}\times10^{6}$",
+            rf"$\mathrm{{M}}_\infty = {meta['mach']:.2f}$",
+            rf"$\alpha = {meta['alpha']:.3f}^{{\circ}}$",
+        ]
+        if meta.get("tu") is not None:
+            parts.insert(1, rf"$\mathrm{{Tu}}_\infty = {meta['tu']:.3f}\%$")
+    else:
+        parts = [
+            rf"Re = {int(meta['reynolds']/1e6)}e6",
+            rf"M  = {meta['mach']:.2f}",
+            rf"α  = {meta['alpha']:.3f}°",
+        ]
+        if meta.get("tu") is not None:
+            parts.insert(0, rf"Tu∞ = {meta['tu']*100:.3f}%")
+
+    return ", ".join(parts) if one_line else "\n".join(parts)
+
+
+
+
+
+
+
+----- ./utils/plot_helpers.py -----
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+def _warn_missing_overlay(labels, overlay_dict, name="Overlay"):
+    if overlay_dict is None:
+        return
+    for label in labels:
+        if label not in overlay_dict or overlay_dict[label] is None or (
+            isinstance(overlay_dict[label], pd.DataFrame) and overlay_dict[label].empty
+        ):
+            print(f"[WARN] {name} files not found for: {label}")
+
+def annotate_metadata_box(ax, forces_file):
+    metadata = {}
+    try:
+        with open(forces_file, "r") as f:
+            for line in f:
+                if "Mach number" in line:
+                    metadata['Mach'] = float(line.split()[-1])
+                elif "Reynolds number" in line:
+                    metadata['Re'] = float(line.split()[-1])
+                elif "Angle of attack" in line:
+                    metadata['AoA'] = float(line.split()[-1])
+        textstr = f"M = {metadata['Mach']:.2f}\nRe = {metadata['Re']:.1e}\nAoA = {metadata['AoA']:.1f}°"
+        props = dict(boxstyle='round', facecolor='white', alpha=0.75)
+        ax.text(0.98, 0.05, textstr, transform=ax.transAxes, fontsize=9,
+                verticalalignment='bottom', horizontalalignment='right', bbox=props)
+    except Exception as e:
+        print(f"[WARN] Could not annotate metadata: {e}")
+
+----- ./utils/path_helpers.py -----
+from pathlib import Path
+import os
+
+
+def get_comparison_save_path(paths: list[Path], mode: str = "A") -> Path:
+    """
+    Determine the directory to save comparison plots based on a save mode.
+
+    Modes:
+        A: Deepest common ancestor + "_compare"         [default]
+        B: Current working directory + "_compare"
+        C: User home + "su2_postprocess_compare"
+        D: Parent of the first path + "_compare"
+
+    Args:
+        paths: List of case paths (Path objects)
+        mode: Save mode ('A', 'B', 'C', 'D')
+
+    Returns:
+        A Path object pointing to the desired save directory.
+    """
+    if not paths:
+        raise ValueError("No paths provided for comparison output.")
+
+    resolved = [p.resolve() for p in paths]
+    mode = mode.upper()
+
+    if mode == "A":
+        common_prefix = Path(os.path.commonpath([str(p) for p in resolved]))
+        return common_prefix.parent / (common_prefix.name + "_compare")
+    elif mode == "B":
+        return Path.cwd() / "_compare"
+    elif mode == "C":
+        return Path.home() / "su2_postprocess_compare"
+    elif mode == "D":
+        return resolved[0].parent / "_compare"
+    else:
+        raise ValueError(f"Unknown save mode '{mode}'. Use A, B, C, or D.")
+
+
+
+
+
+----- ./plots/transition.py -----
+import matplotlib.pyplot as plt
+
+def plot_transition_map(df):
+    if "Turb_index" not in df.columns:
+        print("Warning: 'Turb_index' not found — skipping transition plot.")
+        return None
+
+    fig, ax = plt.subplots()
+    ti = df["Turb_index"].clip(0, 1)
+    sc = ax.scatter(df["x"], df["y"], c=ti, cmap='viridis', s=8)
+    ax.set_title("Transition Indicator Map")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    plt.colorbar(sc, ax=ax, label="Turbulence Index")
+    return fig
+
+
+----- ./plots/__init__.py -----
+
+----- ./plots/cp_cf.py -----
+
+import matplotlib.pyplot as plt
+
+def plot_cp_cf(df):
+    fig1, ax1 = plt.subplots()
+    ax1.plot(df['x'], df['Pressure_Coefficient'])
+    ax1.set_xlabel('x')
+    ax1.set_ylabel('Cp')
+    ax1.set_title('Pressure Coefficient')
+    ax1.invert_yaxis()
+
+    fig2, ax2 = plt.subplots()
+    ax2.plot(df['x'], df['Skin_Friction_Coefficient_x'])
+    ax2.set_xlabel('x')
+    ax2.set_ylabel('Cf')
+    ax2.set_title('Skin Friction Coefficient')
+
+    return fig1, fig2
+
+----- ./plots/__pycache__/cp_cf.cpython-312.pyc -----
+
+----- ./plots/__pycache__/cumulative.cpython-312.pyc -----
+
+----- ./plots/__pycache__/compare_surface.cpython-312.pyc -----
+
+----- ./plots/__pycache__/__init__.cpython-312.pyc -----
+
+----- ./plots/__pycache__/plot_cp_cf_it_multi.cpython-312.pyc -----
+
+----- ./plots/__pycache__/transition.cpython-312.pyc -----
+
+----- ./plots/cumulative.py -----
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from su2_postprocess.utils.parse_forces import extract_case_metadata
+
+def plot_cp_cf_it(df, merge_slider=0.03, show_cp=True, show_cf=True, show_it=True, show_map=True,
+                  forces_file=None, xfoil_df=None, exp_df=None):
+    merge_slider = np.clip(merge_slider, 0.0, 1.0)
+
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+    cp = df["Pressure_Coefficient"].to_numpy()
+    cf = df["Skin_Friction_Coefficient_x"].to_numpy()
+    has_it = "Turb_index" in df.columns
+    it = df["Turb_index"].clip(0, 1).to_numpy() if has_it else None
+
+
+    section_order = []
+    if show_cp: section_order.append("cp")
+    if show_cf: section_order.append("cf")
+    if show_it and has_it: section_order.append("it")
+    if show_map: section_order.append("map")
+
+    section_heights = {
+        "cp": 0.28,
+        "cf": 0.22,
+        "it": 0.18,
+        "map": 0.25
+    }
+    spacing = 0.1 * merge_slider
+
+    bottoms = {}
+    current_bottom = 1.0
+    for name in section_order:
+        height = section_heights[name]
+        bottoms[name] = current_bottom - height
+        current_bottom = bottoms[name] - spacing
+
+    fig_height = sum([section_heights[name] for name in section_order]) + len(section_order) * spacing
+    fig = plt.figure(figsize=(5, fig_height * 9))
+
+    custom_cmap = LinearSegmentedColormap.from_list("blue_purple_red", [
+        (0.0, "#0044ff"),  # blue
+        (0.5, "#933fe0"),  # blue
+        (1.0, "#ff0000"),  # red
+    ])
+
+    def stylize(ax, show_xlabel=False, show_xticks=False, show_bottom_spine=False, show_right_spine=False):
+
+        ax.set_facecolor("none")
+        ax.grid(False)
+        ax.tick_params(axis='x', direction='out', width=0.8, bottom=show_xticks, top=False, labelbottom=show_xticks)
+        ax.tick_params(axis='y', direction='out', width=0.8)
+        for spine in ['top']:
+            ax.spines[spine].set_visible(False)
+        ax.spines['left'].set_visible(True)
+        ax.spines['left'].set_linewidth(0.8)
+        if show_bottom_spine:
+            ax.spines['bottom'].set_visible(True)
+            ax.spines['bottom'].set_linewidth(0.8)
+        else:
+            ax.spines['bottom'].set_visible(False)
+        if show_xlabel:
+            ax.set_xlabel(r'x/c', fontsize=12)
+
+    if "cp" in section_order:
+        ax_cp = fig.add_axes([0.12, bottoms["cp"], 0.75, section_heights["cp"]])
+        ax_cp.plot(x, cp, 'k-', lw=0.5)
+        ax_cp.set_ylabel(r'C$_p$', fontsize=12)
+        ax_cp.invert_yaxis()
+        cp_all = [cp]
+        if xfoil_df is not None and "Cp" in xfoil_df.columns:
+            cp_all.append(xfoil_df["Cp"].to_numpy())
+        if exp_df is not None and "Cp" in exp_df.columns:
+            cp_all.append(exp_df["Cp"].to_numpy())
+
+        cp_all_flat = np.concatenate(cp_all)
+        cp_ymax = np.max(cp_all_flat)
+        cp_ymin = np.min(cp_all_flat)
+        margin = 0.05 * (cp_ymax - cp_ymin)
+
+        ax_cp.set_ylim(cp_ymax + margin, cp_ymin - margin)
+        
+        stylize(ax_cp, show_xticks=False) 
+
+        ax_cp.grid(which='major', linestyle=':', linewidth=0.5, alpha=0.1)
+        
+        ax_cp.set_xlim(0, 1)
+        
+        if forces_file:
+            label = extract_case_metadata(forces_file)
+            ax_cp.text(
+                1.2, 1.15, label,
+                fontsize=10, ha='right', va='top',
+                transform=ax_cp.transAxes,
+                bbox=dict(facecolor='white', edgecolor='gray', linewidth=0.1, boxstyle='round, pad=.2', alpha = 1)
+            )
+
+
+
+
+    if xfoil_df is not None and {"x", "Cp"}.issubset(xfoil_df.columns):
+        ax_cp.plot(xfoil_df["x"], xfoil_df["Cp"], ls="-.", lw=1.0, color="black", label="XFOIL")
+
+    if exp_df is not None and {"x", "Cp"}.issubset(exp_df.columns):
+        ax_cp.plot(exp_df["x"], exp_df["Cp"], ls=":", lw=1.0, color="gray", label="Experiment")
+
+    if xfoil_df is not None or exp_df is not None:
+        ax_cp.legend(fontsize=9, loc="lower right")
+
+    if "cf" in section_order:
+        ax_cf = fig.add_axes([0.12, bottoms["cf"], 0.75, section_heights["cf"]])
+
+        ax_cf.plot(x, cf, 'k-', lw=0.5, label="SU2")
+
+        cf_all = [cf]
+
+        if xfoil_df is not None and {"x", "cf"}.issubset(xfoil_df.columns):
+            ax_cf.plot(xfoil_df["x"], xfoil_df["cf"], '--', lw=1.0, label="XFOIL")
+            cf_all.append(xfoil_df["cf"].to_numpy())
+
+        if exp_df is not None and {"x", "cf"}.issubset(exp_df.columns):
+            ax_cf.plot(exp_df["x"], exp_df["cf"], 'o', ms=2.5, label="Experiment")
+            cf_all.append(exp_df["cf"].to_numpy())
+
+        cf_all_flat = np.concatenate(cf_all)
+        cf_ymin = np.min(cf_all_flat)
+        cf_ymax = np.max(cf_all_flat)
+        cf_margin = 0.05 * (cf_ymax - cf_ymin)
+        ax_cf.set_ylim(cf_ymin - cf_margin, cf_ymax + cf_margin)
+
+        ax_cf.set_ylabel(r'C$_f$', fontsize=12)
+        ax_cf.set_xlim(0, 1)
+
+        stylize(ax_cf, show_xlabel=True, show_xticks=True, show_bottom_spine=True)
+        ax_cf.grid(which='major', linestyle=':', linewidth=0.5, alpha=0.1)
+
+        if len(ax_cf.get_legend_handles_labels()[1]) > 1:
+            ax_cf.legend(fontsize=9, loc="best")
+
+    if xfoil_df is not None and {"x", "cf"}.issubset(xfoil_df.columns):
+        ax_cf.plot(xfoil_df["x"], xfoil_df["cf"], '--', lw=1.0, label="XFOIL")
+
+    if exp_df is not None and {"x", "cf"}.issubset(exp_df.columns):
+        ax_cf.plot(exp_df["x"], exp_df["cf"], 'o', ms=2.5, label="Experiment")
+
+    if xfoil_df is not None or exp_df is not None:
+        ax_cf.legend(fontsize=9, loc="best")
+
+
+
+
+
+    if "it" in section_order:
+        ax_it = fig.add_axes([0.12, bottoms["it"], 0.75, section_heights["it"]])
+        ax_it.plot(x, it, 'k-', lw=0.5)
+        ax_it.set_ylabel(r'i$_t$', fontsize=12)
+        ax_it.set_xlim(0, 1)
+        ax_it.set_ylim(0, 1.05)
+        stylize(ax_it, show_xlabel=True, show_xticks=True, show_bottom_spine=True)
+
+    if "map" in section_order:
+        ax_map = fig.add_axes([0.12, bottoms["map"], 0.75, section_heights["map"]])
+        ax_map.set_xlim(-0.005, 1)
+        ax_map.set_ylim(y.min() - 0.01, y.max() + 0.01)
+        ax_map.set_aspect('equal')
+        ax_map.axis('off')
+
+        points = np.array([x, y]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+        if has_it and show_map:
+            lc = LineCollection(segments, cmap='viridis_r', norm=plt.Normalize(0, 1))
+            lc.set_array(it)
+            lc.set_linewidth(1.2)
+            ax_map.add_collection(lc)
+
+            cax = fig.add_axes([0.9, bottoms["map"] + 0.06, 0.02, 0.16])
+            cbar = plt.colorbar(lc, cax=cax)
+            cbar.set_ticks([0, 0.5, 1])
+            cbar.set_ticklabels(['0', '0.5', '1'])
+            cbar.set_label(r'Turbulence Index, i$_t$', fontsize=10)
+            cbar.ax.tick_params(labelsize=9)
+        else:
+            ax_map.plot(x, y, 'k-', lw=1.0)
+
+        
+
+
+
+
+
+    return fig
+'''
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def plot_cp_cf_it(df, merge_slider=1.0):
+    """
+    Plots a stacked Cp–Cf–i_t plot. Adds airfoil transition inset if Turb_index is present.
+    """
+    merge_slider = np.clip(merge_slider, 0.0, 1.0)
+
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+    cp = df["Pressure_Coefficient"].to_numpy()
+    cf = df["Skin_Friction_Coefficient_x"].to_numpy()
+    has_it = "Turb_index" in df.columns
+    it = df["Turb_index"].clip(0, 1).to_numpy() if has_it else None
+
+    fig = plt.figure(figsize=(6, 8 if has_it else 5))
+
+    cp_height = 0.4
+    cf_height = 0.3
+    it_height = 0.2 if has_it else 0.0
+    spacing = -0.09#0.03 * merge_slider
+
+    cp_bottom = 0.72 if has_it else 0.55
+    cf_bottom = cp_bottom - cp_height - spacing
+    it_bottom = cf_bottom - cf_height - spacing
+
+    ax_cp = fig.add_axes([0.15, cp_bottom, 0.65, cp_height])
+    ax_cp.plot(x, cp, 'k-', lw=1)
+    ax_cp.set_ylabel(r'$C_p$', fontsize=12)
+    ax_cp.invert_yaxis()
+    ax_cp.set_xlim(0, 1)
+    ax_cp.set_aspect('auto')
+    ax_cp.tick_params(axis='x', bottom=False, labelbottom=False)
+    ax_cp.spines['bottom'].set_visible(False)
+
+    ax_cf = fig.add_axes([0.15, cf_bottom, 0.65, cf_height], sharex=ax_cp)
+    ax_cf.plot(x, cf, 'k-', lw=1)
+    ax_cf.set_ylabel(r'$C_f$', fontsize=12)
+    ax_cf.set_xlim(0, 1)
+    ax_cf.set_aspect('auto') 
+    ax_cf.tick_params(labelbottom=not has_it)
+    ax_cf.tick_params(axis='x', bottom=False, labelbottom=False)
+    ax_cf.tick_params(axis='x', top=False, labeltop=False)
+    ax_cf.spines['bottom'].set_visible(False)
+    ax_cf.spines['top'].set_visible(False)
+
+    if has_it:
+        ax_it = fig.add_axes([0.15, it_bottom, 0.65, it_height], sharex=ax_cp)
+        ax_it.plot(x, it, 'k-', lw=1)
+        ax_it.fill_between(x, 0, it, color='gray', alpha=0.3)
+        ax_it.set_ylabel(r'$i_t$', fontsize=12)
+        ax_it.set_xlabel(r'$x/c$', fontsize=12)
+        ax_it.set_xlim(0, 1)
+        ax_it.set_ylim(0, 1.05)
+        ax_it.set_aspect('auto')
+        ax_it.tick_params(axis='x', top=False, labeltop=False)
+        ax_it.spines['bottom'].set_visible(False)
+        ax_it.spines['top'].set_visible(False)
+    else:
+        print("Note: 'Turb_index' not found — generating Cp–Cf only.")
+
+
+    return fig
+'''
+
+'''
+import matplotlib.pyplot as plt
+import numpy as np
+
+def plot_cp_cf_it(df, merge_slider=1.0):
+    """
+    Plots a stacked Cp–Cf–i_t plot. Adds a full-width transition map at the bottom.
+    """
+    merge_slider = np.clip(merge_slider, 0.0, 1.0)
+
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+    cp = df["Pressure_Coefficient"].to_numpy()
+    cf = df["Skin_Friction_Coefficient_x"].to_numpy()
+    has_it = "Turb_index" in df.columns
+    it = df["Turb_index"].clip(0, 1).to_numpy() if has_it else None
+
+    cp_height = 0.25
+    cf_height = 0.20
+    it_height = 0.15 if has_it else 0.0
+    map_height = 0.28 if has_it else 0.0
+    spacing = 0.025 * merge_slider
+
+    cp_bottom = 0.95 - cp_height
+    cf_bottom = cp_bottom - cf_height - spacing
+    it_bottom = cf_bottom - it_height - spacing
+    map_bottom = it_bottom - map_height - spacing
+
+    fig_height = cp_height + cf_height + it_height + map_height + 4 * spacing
+    fig = plt.figure(figsize=(7, fig_height * 10))
+
+    ax_cp = fig.add_axes([0.15, cp_bottom, 0.75, cp_height])
+    ax_cp.plot(x, cp, 'k-', lw=1)
+    ax_cp.set_ylabel(r'$C_p$', fontsize=12)
+    ax_cp.invert_yaxis()
+    ax_cp.set_xlim(0, 1)
+    ax_cp.grid(True)
+    ax_cp.tick_params(labelbottom=False)
+
+    ax_cf = fig.add_axes([0.15, cf_bottom, 0.75, cf_height], sharex=ax_cp)
+    ax_cf.plot(x, cf, 'k-', lw=1)
+    ax_cf.set_ylabel(r'$C_f$', fontsize=12)
+    ax_cf.grid(True)
+    ax_cf.tick_params(labelbottom=False)
+
+    if has_it:
+        ax_it = fig.add_axes([0.15, it_bottom, 0.75, it_height], sharex=ax_cp)
+        ax_it.plot(x, it, 'k-', lw=1)
+        ax_it.fill_between(x, 0, it, color='gray', alpha=0.3)
+        ax_it.set_ylabel(r'$i_t$', fontsize=12)
+        ax_it.set_xlim(0, 1)
+        ax_it.set_ylim(0, 1.05)
+        ax_it.grid(True)
+        ax_it.tick_params(labelbottom=False)
+
+        ax_map = fig.add_axes([0.15, map_bottom, 0.75, map_height])
+        sc = ax_map.scatter(x, y, c=it, cmap='viridis', s=4)
+        ax_map.set_title("Transition Map (iₜ)", fontsize=10)
+        ax_map.axis('equal')
+        ax_map.axis('off')
+    else:
+        print("Note: 'Turb_index' not found — generating Cp–Cf only.")
+
+    return fig
+'''
+
+'''
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.collections import LineCollection
+
+def plot_cp_cf_it(df, merge_slider=1.0):
+    merge_slider = np.clip(merge_slider, 0.0, 1.0)
+
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+    cp = df["Pressure_Coefficient"].to_numpy()
+    cf = df["Skin_Friction_Coefficient_x"].to_numpy()
+    has_it = "Turb_index" in df.columns
+    it = df["Turb_index"].clip(0, 1).to_numpy() if has_it else None
+
+    cp_height = 0.28
+    cf_height = 0.22
+    it_height = 0.18 if has_it else 0.0
+    map_height = 0.25 if has_it else 0.0
+    spacing = 0.005 * merge_slider
+
+    cp_bottom = 0.95 - cp_height
+    cp_bottom = 1 - cp_height
+    cf_bottom = cp_bottom - cf_height - spacing
+    it_bottom = cf_bottom - it_height - spacing
+    map_bottom = it_bottom - map_height - spacing
+
+    fig_height = cp_height + cf_height + it_height + map_height + 4 * spacing
+    fig = plt.figure(figsize=(5, fig_height * 9))  # Wider to accommodate external legend
+ 
+    def stylize(ax, show_xlabel=False, show_xticks=False, show_bottom_spine=False):
+        ax.set_facecolor("none")
+        ax.grid(False)
+        ax.tick_params(axis='x', direction='in', width=0.8, bottom=show_xticks, top=False, labelbottom=show_xticks)
+        ax.tick_params(axis='y', direction='in', width=0.8)
+        for spine in ['top', 'right']:
+            ax.spines[spine].set_visible(False)
+        ax.spines['left'].set_visible(True)
+        ax.spines['left'].set_linewidth(0.8)
+        if show_bottom_spine:
+            ax.spines['bottom'].set_visible(True)
+            ax.spines['bottom'].set_linewidth(0.8)
+        else:
+            ax.spines['bottom'].set_visible(False)
+        if show_xlabel:
+            ax.set_xlabel(r'x/c', fontsize=12)
+
+    ax_cp = fig.add_axes([0.12, cp_bottom, 0.75, cp_height])
+    ax_cp.plot(x, cp, 'k-', lw=0.5)
+    ax_cp.set_ylabel(r'C$_p$', fontsize=12)
+    ax_cp.invert_yaxis()
+    ax_cp.set_ylim(cp.max(),cp.min()+ 0.1*cp.min())    
+    ax_cp.set_xlim(0, 1)
+    stylize(ax_cp)
+
+    ax_cf = fig.add_axes([0.12, cf_bottom, 0.75, cf_height], sharex=ax_cp)
+    ax_cf.plot(x, cf, 'k-', lw=0.5)
+    ax_cf.set_ylabel(r'C$_f$', fontsize=12)
+    stylize(ax_cf)
+
+    if has_it:
+        ax_it = fig.add_axes([0.12, it_bottom, 0.75, it_height], sharex=ax_cp)
+        ax_it.plot(x, it, 'k-', lw=0.5)
+        ax_it.set_ylabel(r'i$_t$', fontsize=12)
+        ax_it.set_xlim(0, 1)
+        ax_it.set_ylim(0, 1.05)
+        stylize(ax_it, show_xlabel=True, show_xticks=True, show_bottom_spine=True)
+
+        ax_map = fig.add_axes([0.12, map_bottom, 0.75, map_height])
+
+
+        points = np.array([x, y]).T.reshape(-1, 1, 2)
+        segments = np.concatenate([points[:-1], points[1:]], axis=1)
+
+        lc = LineCollection(segments, cmap='viridis', norm=plt.Normalize(0, 1))
+        lc = LineCollection(segments, cmap='plasma', norm=plt.Normalize(0, 1))
+        lc = LineCollection(segments, cmap='inferno', norm=plt.Normalize(0, 1))
+        lc = LineCollection(segments, cmap='cividis', norm=plt.Normalize(0, 1))
+        lc = LineCollection(segments, cmap='seismic', norm=plt.Normalize(0, 1))
+        lc.set_array(it)
+        lc.set_linewidth(1.2)
+
+        ax_map.add_collection(lc)
+        ax_map.set_xlim(-0.005, 1)
+        ax_map.set_ylim(y.min() - 0.01, y.max() + 0.01)
+        ax_map.set_aspect('equal')
+        ax_map.axis('off')
+
+        ax_map.set_xlim(-0.005, 1)  # match airfoil to flow panels
+        ax_map.axis('off')
+        ax_map.set_aspect('equal')
+
+        cax = fig.add_axes([0.9, map_bottom + 0.06, 0.02, 0.16])
+        cbar = plt.colorbar(lc, cax=cax)
+        cbar.set_ticks([0, 0.5, 1])
+        cbar.set_ticklabels(['0', '0.5', '1'])
+        cbar.set_label(r'Turbulence Index, i$_t$', fontsize=10)
+        cbar.ax.tick_params(labelsize=9)
+    else:
+        stylize(ax_cf, show_xlabel=True, show_xticks=True, show_bottom_spine=True)
+        print("Note: 'Turb_index' not found — generating Cp–Cf only.")
+
+    return fig
+'''
+
+
+
+
+
+
+
+
+
+
+        
+        
+
+
+        
+
+
+
+
+
+
+        
+
+
+
+
+
+
+
+----- ./plots/compare_surface.py -----
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----- ./plots/plot_cp_cf_it_multi.py -----
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+
+def _sanitize(df):
+    if df is None or not hasattr(df, "columns"):
+        return df
+    for col in ("x", "y"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["x", "y"])
+
+def plot_cp_cf_it_multi(
+    dfs, labels,
+    *,                       # all following must be passed by keyword
+    meta_box_text=None,
+    show_meta_box=False,
+    merge_slider=0.03,
+    show_cp=True,
+    show_cf=True,
+    show_it=False,
+    show_map=True,
+    show_airfoil=True,
+    forces_files=None,
+    xfoil_cp_list=None,
+    xfoil_cf_list=None,
+    exp_cp_list=None,
+    exp_cf_list=None,
+    label_style=None,
+    show_legends_cp=True,
+    show_legends_cf=False,
+    show_legends_it=False,
+    case_colors=None,
+    case_styles=None,
+):
+    n = len(dfs)
+    if len(labels) != n:
+        raise ValueError("dfs and labels length mismatch.")
+    if forces_files and len(forces_files) != n:
+        raise ValueError("forces_files length mismatch.")
+    merge_slider = np.clip(merge_slider, 0.0, 1.0)
+
+    panels = []
+    if show_cp:      panels.append("cp")
+    if show_cf:      panels.append("cf")
+    if show_it and any("Turb_index" in df.columns for df in dfs):
+        panels.append("it")
+    if show_airfoil: panels.append("airfoil")
+    if show_map and "Turb_index" in dfs[0].columns:
+        panels.append("map")
+
+    section_h = {"cp": .28, "cf": .22, "it": .18, "airfoil": .20, "map": .25}
+    spacing   = 0.1 * merge_slider
+    bottoms   = {}
+    cur = 1.0
+    for p in panels:
+        bottoms[p] = cur - section_h[p]
+        cur = bottoms[p] - spacing
+    fig_h = sum(section_h[p] for p in panels) + len(panels) * spacing
+    fig = plt.figure(figsize=(5, fig_h * 9))
+
+    def stylize(ax, *, show_xlabel=False, show_xticks=False, show_bottom=False):
+        ax.set_facecolor("none")
+        ax.grid(True, ls=":", lw=.5, alpha=.1)
+        ax.tick_params(axis="x", bottom=show_xticks, labelbottom=show_xticks)
+        ax.tick_params(axis="y", direction="out", width=.8)
+        ax.spines["top"].set_visible(False)
+        for sp in ("left", "right", "bottom"):
+            ax.spines[sp].set_linewidth(1.0)
+        ax.spines["bottom"].set_visible(show_bottom)
+        if show_xlabel:
+            ax.set_xlabel(r"$x/c$", fontsize=13)
+
+    last_panel = panels[-3] if "map" in panels and "airfoil" in panels else (
+                 panels[-2] if ("map" in panels or "airfoil" in panels) else
+                 panels[-1])
+
+    if "cp" in panels:
+        ax = fig.add_axes([.12, bottoms["cp"], .75, section_h["cp"]])
+        cp_vals = []
+
+        for i, (df, lbl) in enumerate(zip(dfs, labels)):
+            kw = {"lw": .6}
+            if case_colors and i < len(case_colors): kw["color"] = case_colors[i]
+            if case_styles and i < len(case_styles): kw["linestyle"] = case_styles[i]
+            ax.plot(df["x"], df["Pressure_Coefficient"], label=lbl, **kw)
+            cp_vals.append(df["Pressure_Coefficient"].to_numpy())
+
+            for src, style, lab in (
+                (xfoil_cp_list, "-.", f"XFOIL {i}"),
+                (exp_cp_list,   "x",  f"EXP")
+            ):
+                odf = _sanitize(src[i]) if src else None
+                if odf is not None:
+                    odf = odf[odf.x <= 1.0]
+                    ax.plot(odf["x"], odf["y"], style, lw=.6, ms=3.5,
+                            color="black" if "XFOIL" in lab else "red",
+                            label=lab)
+                    cp_vals.append(odf["y"].to_numpy())
+
+        if cp_vals:
+            flat = np.concatenate(cp_vals)
+            pad  = .05 * (flat.max() - flat.min())
+            ax.set_ylim(flat.max() + pad, flat.min() - pad)
+
+        ax.set_ylabel(r"$C_p$", fontsize=13)
+        ax.set_xlim(0, dfs[0]["x"].max())
+        stylize(ax, show_xticks=False)
+
+        if show_meta_box and meta_box_text:
+            ax.text(1.2, 1.12, meta_box_text,
+                    transform=ax.transAxes, fontsize=10,
+                    ha="right", va="top",
+                    bbox=dict(facecolor="white", edgecolor="black",
+                              boxstyle="round,pad=0.3"))
+
+        if show_legends_cp and ax.get_legend_handles_labels()[1]:
+            ax.legend(fontsize=9, loc="lower right")
+
+    if "cf" in panels:
+        ax = fig.add_axes([.12, bottoms["cf"], .75, section_h["cf"]])
+        cf_vals = []
+
+        for i, (df, lbl) in enumerate(zip(dfs, labels)):
+            kw = {"lw": .6}
+            if case_colors and i < len(case_colors): kw["color"] = case_colors[i]
+            if case_styles and i < len(case_styles): kw["linestyle"] = case_styles[i]
+            ax.plot(df["x"], df["Skin_Friction_Coefficient_x"], label=lbl, **kw)
+            cf_vals.append(df["Skin_Friction_Coefficient_x"].to_numpy())
+
+            for src, style, lab in (
+                (xfoil_cf_list, "-.", f"XFOIL {i}"),
+                (exp_cf_list,   "x-", "EXP")
+            ):
+                odf = _sanitize(src[i]) if src else None
+                if odf is None:
+                    continue
+                odf = odf[odf.x <= 1.0]
+                xs  = odf["x"].to_numpy()
+                idx = int(np.nanargmin(np.diff(xs))) + 1
+                up, lo = odf.iloc[:idx], odf.iloc[idx:][::-1]
+                for seg in (up, lo):
+                    ax.plot(seg["x"], seg["y"], style, lw=.6,
+                            color="black" if "XFOIL" in lab else "red",
+                            label=lab if seg is up else None)
+                    cf_vals.append(seg["y"].to_numpy())
+
+        if cf_vals:
+            flat = np.concatenate(cf_vals)
+            pad  = .05 * (flat.max() - flat.min())
+            ax.set_ylim(flat.min() - pad, flat.max() + pad)
+
+        ax.set_ylabel(r"$C_f$", fontsize=13)
+        ax.set_xlim(0, dfs[0]["x"].max())
+        stylize(ax,
+                show_xlabel=(last_panel == "cf"),
+                show_xticks=(last_panel == "cf"),
+                show_bottom=(last_panel == "cf"))
+        if show_legends_cf and ax.get_legend_handles_labels()[1]:
+            ax.legend(fontsize=9, loc="upper right")
+
+    if "it" in panels:
+        ax = fig.add_axes([.12, bottoms["it"], .75, section_h["it"]])
+        for i, (df, lbl) in enumerate(zip(dfs, labels)):
+            if "Turb_index" not in df.columns:
+                continue
+            kw = {"lw": .6}
+            if case_colors and i < len(case_colors): kw["color"] = case_colors[i]
+            if case_styles and i < len(case_styles): kw["linestyle"] = case_styles[i]
+            ax.plot(df["x"], df["Turb_index"].clip(0, 1), label=lbl, **kw)
+
+        ax.set_ylabel(r"$i_t$", fontsize=13)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1.05)
+        stylize(ax,
+                show_xlabel=(last_panel == "it"),
+                show_xticks=(last_panel == "it"),
+                show_bottom=(last_panel == "it"))
+        if show_legends_it and ax.get_legend_handles_labels()[1]:
+            ax.legend(fontsize=9, loc="upper right")
+
+    if "airfoil" in panels:
+        ax = fig.add_axes([.12, bottoms["airfoil"], .75, section_h["airfoil"]])
+        for df in dfs:
+            ax.plot(df["x"], df["y"], "-", lw=.6, color="black")
+        ax.set_xlim(-.005, 1)
+        ymin = min(d["y"].min() for d in dfs) - .01
+        ymax = max(d["y"].max() for d in dfs) + .01
+        ax.set_ylim(ymin, ymax)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+    if "map" in panels and "Turb_index" in dfs[0].columns:
+        df0 = dfs[0]
+        pts = np.array([df0["x"], df0["y"]]).T.reshape(-1, 1, 2)
+        segs = np.concatenate([pts[:-1], pts[1:]], axis=1)
+        lc = LineCollection(segs, cmap="viridis_r", norm=plt.Normalize(0, 1))
+        lc.set_array(df0["Turb_index"].clip(0, 1))
+        lc.set_linewidth(1.2)
+
+        ax = fig.add_axes([.12, bottoms["map"], .75, section_h["map"]])
+        ax.add_collection(lc)
+        ax.set_xlim(-.005, 1)
+        ax.set_ylim(df0["y"].min() - .01, df0["y"].max() + .01)
+        ax.set_aspect("equal")
+        ax.axis("off")
+
+        cax = fig.add_axes([.9, bottoms["map"] + .06, .02, .16])
+        cbar = plt.colorbar(lc, cax=cax)
+        cbar.set_label(r"Turbulence Index, $i_t$", fontsize=12,
+                       rotation=90, va="center")
+        cbar.ax.yaxis.set_label_coords(5, .605)
+        cbar.set_ticks([0, .5, 1])
+        cbar.ax.tick_params(labelsize=9)
+
+    return fig
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----- ./__main__.py -----
+from su2_postprocess.cli.cli_main import main
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+        
+
+
+
+
+'''
+def main():
+    parser = argparse.ArgumentParser(description="SU2 Postprocessing Pipeline")
+    parser.add_argument('--root', required=True, help='Root directory of SU2 cases')
+    args = parser.parse_args()
+
+    compare = subparsers.add_parser("compare-surface", help="Compare Cp, Cf, i_t across multiple cases")
+    compare.add_argument('--cases', nargs='+', type=str, required=True, help='List of case directories')
+    compare.add_argument('--log-cf', action='store_true', help='Use log scale for Cf axis')
+    compare.add_argument('--save', type=str, help='Path to save output plot (omit to show only)')
+    compare.add_argument('--format', type=str, default='png', choices=['png', 'svg'], help='Output file format')
+
+    elif args.command == "compare-surface":
+        from su2_postprocess.plots.compare_surface import plot_comparison
+        case_paths = [Path(c) for c in args.cases]
+        plot_comparison(case_paths, log_cf=args.log_cf, save_path=args.save, fmt=args.format)
+
+
+    case_files = find_case_dirs(args.root)
+    for surface_path in case_files:
+        case = surface_path.parent
+        print(f"Processing case: {case}")
+        forces_path = case / "forces_bdwn_.dat"
+        df, elements = parse_felineseg_surface(surface_path)
+        df = reorder_surface_nodes_from_elements(df, elements)
+        fig_cp, fig_cf = plot_cp_cf(df)
+        fig_ti = plot_transition_map(df)
+        fig_combined = plot_cp_cf_it(df, show_cp=True, show_cf=True, show_it=False, show_map=True, forces_file=forces_path)
+        save_plot(fig_combined, case, "Cp_Cf_TurbIndex")
+        save_plot(fig_cp, case, "Cp_vs_x")
+        save_plot(fig_cf, case, "Cf_vs_x")
+        if fig_ti is not None:
+        	save_plot(fig_ti, case, "Transition_Map")
+
+if __name__ == "__main__":
+    main()
+'''    
+
+----- ./cli/single_main.py -----
+from pathlib import Path
+from su2_postprocess.io.file_scan import find_case_dirs
+from su2_postprocess.io.output import save_plot
+from su2_postprocess.parser.parse_felineseg_surface import parse_felineseg_surface
+from su2_postprocess.utils.reorder import reorder_surface_nodes_from_elements
+from su2_postprocess.utils.parse_metadata import extract_case_metadata_fallback
+from su2_postprocess.utils.overlay_loader import load_overlay_file, load_overlay_dir_by_prefix
+from su2_postprocess.plots.plot_cp_cf_it_multi import plot_cp_cf_it_multi
+from su2_postprocess.plots.cp_cf import plot_cp_cf
+from su2_postprocess.plots.transition import plot_transition_map
+from su2_postprocess.utils.label_helpers import flow_metadata_text, legend_label
+
+
+def single_main(args):
+    print(f"Entered 'single' mode for root: {args.root}")
+    surf_files = find_case_dirs(args.root)
+    print(f"Found {len(surf_files)} surface file(s)")
+    if not surf_files:
+        print("[ERROR] No surface files found.")
+        return
+
+    exp_cp, exp_cf = {}, {}
+    xcp, xcf       = {}, {}
+    if args.exp_dir:
+        exp_cp, exp_cf = load_overlay_dir_by_prefix(Path(args.exp_dir))
+    if args.xfoil_file:
+        p = Path(args.xfoil_file)
+        (xcp if p.stem.lower().startswith("cp_") else xcf)[p.stem.lower()] = load_overlay_file(p)
+    elif args.xfoil_dir:
+        xcp, xcf = load_overlay_dir_by_prefix(Path(args.xfoil_dir))
+
+    for surf_path in surf_files:
+        try:
+            case_dir   = surf_path.parent
+            force_file = next(case_dir.glob("forces_bdwn_*.dat"), None)
+            if force_file is None:
+                print(f"[WARN] No forces_bdwn_*.dat found in {case_dir}")
+                continue
+
+            df, elems = parse_felineseg_surface(surf_path)
+            df = reorder_surface_nodes_from_elements(df, elems)
+            label_full, meta = extract_case_metadata_fallback(force_file, return_metadata=True, fields=["turbulence_model", "transition_model", "reynolds", "tu", "mach", "alpha"])
+            slug = f"m{meta['mach']:.2f}_re{int(meta['reynolds']/1e6)}e6_aoa{int(round(meta['alpha']))}".lower()
+            
+            def pick(dct, prefix):
+                if f"{prefix}_{slug}" in dct:
+                    return dct[f"{prefix}_{slug}"]
+                for k, v in dct.items():
+                    if slug in k:
+                        return v
+                return None
+
+            fig = plot_cp_cf_it_multi(
+                [df], [legend_label(meta, args.label_style, "", 1)],
+                meta_box_text=label_full,
+                show_meta_box=True,
+                show_cp=True, show_cf=True,
+                show_it=args.it, show_map=args.map,
+                show_airfoil=args.show_airfoil,
+                forces_files=[force_file],
+                xfoil_cp_list=[pick(xcp, "cp")],
+                xfoil_cf_list=[pick(xcf, "cf")],
+                exp_cp_list=[pick(exp_cp, "cp")],
+                exp_cf_list=[pick(exp_cf, "cf")],
+                label_style=args.label_style,
+                show_legends_cp=False,
+                show_legends_cf=False,
+                show_legends_it=False,
+                case_colors=args.case_colors,
+                case_styles=args.case_styles,
+            )
+
+            save_plot(fig, case_dir, "Cp_Cf_TurbIndex", format=args.format, dpi=args.dpi)
+
+            fig_cp, fig_cf = plot_cp_cf(df)
+            fig_ti         = plot_transition_map(df)
+            save_plot(fig_cp, case_dir, "Cp_vs_x", format=args.format, dpi=args.dpi)
+            save_plot(fig_cf, case_dir, "Cf_vs_x", format=args.format, dpi=args.dpi)
+            if fig_ti:
+                save_plot(fig_ti, case_dir, "Transition_Map", format=args.format, dpi=args.dpi)
+
+        except Exception as e:
+            print(f"[ERROR] Failed on {surf_path.parent}: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----- ./cli/__init__.py -----
+  
+
+----- ./cli/__pycache__/__init__.cpython-312.pyc -----
+
+----- ./cli/__pycache__/compare_surface_main.cpython-312.pyc -----
+
+----- ./cli/__pycache__/cli_main.cpython-312.pyc -----
+
+----- ./cli/__pycache__/single_bl_main.cpython-312.pyc -----
+
+----- ./cli/__pycache__/compare_bl_main.cpython-312.pyc -----
+
+----- ./cli/__pycache__/single_main.cpython-312.pyc -----
+
+----- ./cli/compare_bl_main.py -----
+"""
+Compare boundary-layer quantities for multiple SU2 cases.
+Creates two figures:
+  1) δ, δ*, θ, H, uₑ   (and optionally Mₑ vs LM_Mach_e)
+  2) grid of u/uₑ vs y/δ profiles
+Output directory = common ancestor + "_compare" (re-uses get_comparison_save_path).
+"""
+
+from pathlib import Path
+from su2_postprocess.bl.extract import extract_boundary_layer
+from su2_postprocess.bl.plots  import plot_bl_params_multi, plot_velocity_profiles_multi
+from su2_postprocess.utils.path_helpers import get_comparison_save_path
+from su2_postprocess.parser.parse_felineseg_surface import parse_felineseg_surface
+from su2_postprocess.utils.reorder import reorder_surface_nodes_from_elements
+from su2_postprocess.utils.parse_metadata import extract_case_metadata_fallback
+from su2_postprocess.io.output import save_plot
+from su2_postprocess.utils.label_helpers import legend_label, flow_metadata_text
+
+def compare_bl_main(args):
+    cases = [Path(p) for p in args.cases]
+    bl_results, labels = [], []
+    meta_boxes = []
+
+    for case in cases:
+        surf = case / "flow_surf_.dat"
+        vol  = case / "flow_vol_.dat"
+        force = next(case.glob("forces_bdwn_*.dat"), None)
+        if not (surf.exists() and vol.exists() and force):
+            print(f"[BL-WARN] missing files in {case} — skipped"); continue
+
+        surf_df, surf_elems = parse_felineseg_surface(surf)
+        surf_df = reorder_surface_nodes_from_elements(surf_df, surf_elems)
+
+        label_full, meta = extract_case_metadata_fallback(force, return_metadata=True)
+        gamma = meta.get("gamma") or 1.4
+
+        res = extract_boundary_layer(
+            surface_nodes=surf_df[["x","y"]].values,
+            surface_normals=None,
+            volume_points=None,
+            vel_mag=None,
+            mach_field=None,
+            vorticity=None,
+            gamma=gamma,
+            methods=[args.edge_method],
+            n_jobs=args.n_jobs,
+        )
+        bl_results.append(res)
+        labels.append(legend_label(meta, "short", case.name, len(labels)+1))
+        meta_boxes.append(flow_metadata_text(meta, one_line=True))
+
+    if not bl_results:
+        print("[BL] nothing to plot"); return
+
+    compare_dir = get_comparison_save_path(cases, args.save)
+    fig1 = plot_bl_params_multi(
+        bl_results, labels,
+        show_H=True,
+        show_Me=args.plot_lm_mach,
+        legends=True,
+        smooth_window=5
+    )
+    save_plot(fig1, compare_dir, "BL_Params_Compare", args.format, args.dpi)
+
+    fig2 = plot_velocity_profiles_multi(bl_results, labels, legends=False)
+    save_plot(fig2, compare_dir, "BL_Profiles_Compare", args.format, args.dpi)
+
+----- ./cli/single_bl_main.py -----
+"""
+Single-case boundary-layer extraction and plotting.
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from scipy.spatial import KDTree
+
+from su2_postprocess.bl.extract_new import extract_boundary_layer
+from su2_postprocess.bl.io import write_bl_table
+from su2_postprocess.bl.plots import plot_bl_params_multi, plot_velocity_profiles_multi
+from su2_postprocess.parser.parse_felineseg_surface import parse_felineseg_surface
+from su2_postprocess.utils.reorder import reorder_surface_nodes_from_elements
+from su2_postprocess.utils.parse_metadata import extract_case_metadata_from_log
+from su2_postprocess.io.output import save_plot
+
+
+def _surface_nodes_and_normals(surf_path: Path):
+    """Return reordered surface nodes (N,2) and outward normals (N,2)."""
+    df, elems = parse_felineseg_surface(surf_path)
+    df = reorder_surface_nodes_from_elements(df, elems)  # BL7 trick
+
+    xy = df[["x", "y"]].to_numpy(float)
+
+    tang = np.diff(xy, axis=0, append=xy[-1:])
+    normals = np.column_stack((-tang[:, 1], tang[:, 0]))
+    nrm = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.divide(normals, np.where(nrm == 0, 1.0, nrm))
+
+    return xy, normals
+
+
+def _read_volume_fields(vol_path: Path):
+    """
+    Return
+        points   :  (N,2)  [x,y]  float64
+        vel_mag  :  (N,)   |V|    float64
+        vort     :  (N,)   ω_z    float64     (NaN-filled if column absent)
+    Raises RuntimeError if no numeric block can be found.
+    """
+    with open(vol_path, "r") as f:
+        lines = f.readlines()
+
+    try:
+        var_idx = next(i for i, ln in enumerate(lines) if "VARIABLES" in ln)
+    except StopIteration:
+        raise RuntimeError(f"No VARIABLES= line in {vol_path}")
+
+    col_names = re.findall(r'"([^"]+)"', lines[var_idx])
+
+    num_pat = re.compile(r"\s*[+-]?\d")
+    first_data_idx = None
+    for i, ln in enumerate(lines[var_idx + 1:], start=var_idx + 1):
+        if num_pat.match(ln):
+            first_data_idx = i
+            break
+    if first_data_idx is None:
+        raise RuntimeError(f"No numeric data found in {vol_path}")
+
+    df = pd.read_csv(
+        vol_path,
+        sep=r"\s+",
+        header=None,
+        names=col_names,
+        comment="#",
+        skiprows=first_data_idx,
+        engine="python",
+    )
+
+    def col(*choices, default=np.nan):
+        for c in choices:
+            if c in df.columns:
+                return df[c].to_numpy(dtype=float)
+        print(f"[BL-WARN] none of {choices} present – filled with NaN")
+        return np.full(len(df), default, dtype=float)
+
+    x = col("x", "X")
+    y = col("y", "Y")
+    u = col("Velocity_x", "Velocity_X", "u", "U")
+    v = col("Velocity_y", "Velocity_Y", "v", "V")
+    vort = col("Vorticity", "Vorticity_z", "Vorticity_Z", "Omega", "omega", default=np.zeros(len(df)))
+
+    points = np.column_stack((x, y))
+    vel_mag = np.sqrt(u ** 2 + v ** 2)
+
+    return points, vel_mag, vort
+
+
+def single_bl_main(args):
+    root = Path(args.root).expanduser().resolve()
+    plot_dir = root / "BL" / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    case_dir = Path(args.root)
+    print(f"[BL] single-case mode → {case_dir}")
+
+    surf = case_dir / "flow_surf_.dat"
+    vol = case_dir / "flow_vol_.dat"
+    log = next(case_dir.glob("log_*.log"), None)
+    if not (surf.exists() and vol.exists() and log):
+        print("[BL-ERROR] missing surface / volume / log files"); return
+
+    surf_df, elems = parse_felineseg_surface(surf)
+    surf_df = reorder_surface_nodes_from_elements(surf_df, elems)
+    surf_nodes, surf_norms = _surface_nodes_and_normals(surf)
+
+    volume_pts, vel_mag, vort = _read_volume_fields(vol)
+
+    meta = extract_case_metadata_from_log(log)
+    gamma = float(meta.get("gamma", 1.4))
+
+    res = extract_boundary_layer(
+        surface_nodes=surf_nodes,
+        surface_normals=surf_norms,
+        volume_points=volume_pts,
+        vel_mag=vel_mag,
+        vorticity=vort,
+        mach_field=None,
+        gamma=gamma,
+        methods=tuple(m.strip() for m in args.edge_method.split(",")),
+        n_jobs=args.n_jobs,
+    )
+
+    out = case_dir / "BL"
+    write_bl_table(out / "bl_thickness_delta.dat", res.x, res.delta[args.edge_method])
+    write_bl_table(out / "bl_displacement_thickness_deltaStar.dat", res.x, res.delta_star[args.edge_method])
+    write_bl_table(out / "bl_momentum_thickness_theta.dat", res.x, res.theta[args.edge_method])
+    write_bl_table(out / "bl_shape_factor_H.dat", res.x, res.H[args.edge_method])
+    write_bl_table(out / "bl_edge_velocity_ue.dat", res.x, res.u_e[args.edge_method])
+    write_bl_table(out / "bl_edge_mach_Me.dat", res.x, res.M_e[args.edge_method])
+
+    if args.plot_lm_mach:
+        fig = plt.figure(figsize=(6, 4))
+        for m, arr in res.M_e.items():
+            plt.plot(res.x, arr, label=m)
+        plt.xlabel("x/c")
+        plt.ylabel("M _e")
+        plt.legend()
+        outfile = plot_dir / "BL_Params.svg"
+        fig.savefig(outfile, bbox_inches="tight")
+        print(f"[INFO] Saved: {outfile}")
+
+    if args.x_locs and res.velocity_profiles:
+        _plot_profiles(res.velocity_profiles, plot_dir)
+
+    plt.close("all")
+
+----- ./cli/compare_surface_main.py -----
+from pathlib import Path
+from su2_postprocess.parser.parse_felineseg_surface import parse_felineseg_surface
+from su2_postprocess.utils.reorder import reorder_surface_nodes_from_elements
+from su2_postprocess.utils.parse_metadata import extract_case_metadata_fallback
+from su2_postprocess.utils.overlay_loader import load_overlay_dir_by_prefix
+from su2_postprocess.utils.path_helpers import get_comparison_save_path
+from su2_postprocess.io.output import save_plot
+from su2_postprocess.plots.plot_cp_cf_it_multi import plot_cp_cf_it_multi
+from su2_postprocess.utils.label_helpers import legend_label, flow_metadata_text
+
+def compare_surface_main(args):
+    print("Entered 'compare-surface' mode")
+    cases = [Path(p) for p in args.cases]
+
+    exp_cp, exp_cf = ({} , {})
+    xcp, xcf       = ({} , {})
+    if args.exp_dir:
+        exp_cp, exp_cf = load_overlay_dir_by_prefix(Path(args.exp_dir))
+    if args.xfoil_dir:
+        xcp, xcf = load_overlay_dir_by_prefix(Path(args.xfoil_dir))
+
+    dfs, labels, forces_paths = [], [], []
+    xcp_list, xcf_list, ecp_list, ecf_list = [], [], [], []
+    meta_texts = []
+
+    def pick(dct, prefix, slug):
+        if slug in dct:
+            return dct[slug]
+        for k, v in dct.items():
+            if slug in k:
+                return v
+        return None
+
+    def uniq_append(lst, item):
+        """Append item but replace duplicates with None so they don't get drawn."""
+        if any(id(item) == id(prev) for prev in lst):
+            lst.append(None)
+        else:
+            lst.append(item)
+
+
+    for case in cases:
+        print(f"[INFO] Processing {case}")
+        surf  = case / "flow_surf_.dat"
+        force = next(case.glob("forces_bdwn_*.dat"), None)
+        if not (surf.exists() and force):
+            print(f"[WARN] Missing surface or forces in {case}")
+            continue
+
+        df, elems = parse_felineseg_surface(surf)
+        df = reorder_surface_nodes_from_elements(df, elems)
+
+        label_full, meta = extract_case_metadata_fallback(force, return_metadata=True)
+        slug = f"m{meta['mach']:.2f}_re{int(meta['reynolds']/1e6)}e6_aoa{int(round(meta['alpha']))}".lower()
+
+        labels.append(legend_label(meta, args.label_style, case.name, len(labels)+1))
+        meta_texts.append(flow_metadata_text(meta))
+
+        dfs.append(df)
+        forces_paths.append(force)
+
+
+        uniq_append(xcp_list, pick(xcp,     "cp", slug))
+        uniq_append(xcf_list, pick(xcf,     "cf", slug))
+        uniq_append(ecp_list, pick(exp_cp,  "cp", slug))
+        uniq_append(ecf_list, pick(exp_cf,  "cf", slug))
+
+
+    n          = len(labels)
+    common_txt = meta_texts[0] if n > 0 and len(set(meta_texts)) == 1 else None
+    fig = plot_cp_cf_it_multi(
+        dfs, labels,
+        meta_box_text=common_txt,
+        show_meta_box=(common_txt is not None),
+        show_cp=True, show_cf=True,
+        show_it=args.it, show_map=args.map,
+        show_airfoil=args.show_airfoil,
+        forces_files=forces_paths,
+        xfoil_cp_list=xcp_list, xfoil_cf_list=xcf_list,
+        exp_cp_list=ecp_list,  exp_cf_list=ecf_list,
+        label_style=args.label_style,
+        show_legends_cp=(args.legends_cp if args.legends_cp is not None else n > 1),
+        show_legends_cf=(args.legends_cf if args.legends_cf is not None else n > 1),
+        show_legends_it=(args.legends_it if args.legends_it is not None else n > 1),
+        case_colors=args.case_colors,
+        case_styles=args.case_styles,
+    )
+
+    save_plot(fig,
+              get_comparison_save_path(cases, args.save),
+              "Cp_Cf_TurbIndex_Compare",
+              format=args.format, dpi=args.dpi)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+----- ./cli/cli_main.py -----
+import argparse
+from su2_postprocess.cli.single_main import single_main
+from su2_postprocess.cli.compare_surface_main import compare_surface_main
+from su2_postprocess.cli.single_bl_main   import single_bl_main   as bl_single_main
+from su2_postprocess.cli.compare_bl_main  import compare_bl_main  as bl_compare_main
+
+def main():
+    parser = argparse.ArgumentParser(description="SU2 Postprocessing CLI")
+    subparsers = parser.add_subparsers(dest="command")
+
+    single = subparsers.add_parser("single", help="Process a single SU2 case")
+    single.add_argument('--root',        required=True)
+    single.add_argument('--xfoil-dir',   type=str)
+    single.add_argument('--xfoil-file',  type=str)
+    single.add_argument('--exp-dir',     type=str)
+    single.add_argument('--format',      type=str, default='svg')
+    single.add_argument('--dpi',         type=int, default=300)
+    single.add_argument('--it',   dest='it',
+                        action='store_true', help='Include i_t subplot')
+    single.add_argument('--map',  dest='map',
+                        action='store_true', help='Include transition map subplot')
+    single.add_argument('--show-airfoil', dest='show_airfoil',
+                        action='store_true', help='Include x–y airfoil panel')
+    single.set_defaults(it=False, map=True, show_airfoil=False)
+    single.add_argument('--label-style',
+                        choices=['short','full','metadata','auto','sense'],
+                        default='sense',
+                        help="Legend label style")
+    single.add_argument('--case-colors', nargs='+',
+                        help='Colors for each SU2 case')
+    single.add_argument('--case-styles', nargs='+',
+                        help='Line styles for each SU2 case')
+    single.add_argument('--xfoil-colors', nargs='+',
+                        help='Colors for each XFOIL overlay')
+    single.add_argument('--exp-colors', nargs='+',
+                        help='Colors for each experimental overlay')   
+    single.add_argument('--xfoil-styles', nargs='+',
+                    help='Line styles for each XFOIL overlay')
+    single.add_argument('--exp-styles', nargs='+',
+                    help='Line styles for each experimental overlay')  
+    single.add_argument('--exp-markers', nargs='+',
+                    help='Markers  for each experimental overlay')                                                               
+
+    compare = subparsers.add_parser("compare-surface",
+                                    help="Compare Cp/Cf/Transition across cases")
+    compare.add_argument('--cases',      nargs='+', required=True)
+    compare.add_argument('--xfoil-dir',  type=str)
+    compare.add_argument('--exp-dir',    type=str)
+    compare.add_argument('--save',       type=str, default='A')
+    compare.add_argument('--format',     type=str, default='svg')
+    compare.add_argument('--dpi',        type=int, default=300)
+    compare.add_argument('--it',   dest='it',
+                         action='store_true', help='Include i_t subplot')
+    compare.add_argument('--map',  dest='map',
+                         action='store_true', help='Include transition map subplot')
+    compare.add_argument('--show-airfoil', dest='show_airfoil',
+                         action='store_true', help='Include x–y airfoil panel')
+    compare.set_defaults(it=True, map=False, show_airfoil=True)
+    compare.add_argument('--label-style',
+                         choices=['short','full','metadata','auto','sense'],
+                         default='short')
+    compare.add_argument('--case-colors', nargs='+',
+                         help='Colors for each SU2 case')
+    compare.add_argument('--case-styles', nargs='+',
+                         help='Line styles for each SU2 case')
+    compare.add_argument('--legends-cp', dest='legends_cp',
+                         action='store_true')
+    compare.add_argument('--no-legends-cp', dest='legends_cp',
+                         action='store_false')
+    compare.set_defaults(legends_cp=None)
+    compare.add_argument('--legends-cf', dest='legends_cf',
+                         action='store_true')
+    compare.add_argument('--no-legends-cf', dest='legends_cf',
+                         action='store_false')
+    compare.set_defaults(legends_cf=False)
+    compare.add_argument('--legends-it', dest='legends_it',
+                         action='store_true')
+    compare.add_argument('--no-legends-it', dest='legends_it',
+                         action='store_false')
+    compare.set_defaults(legends_it=False)
+
+    bl_single = subparsers.add_parser("bl-single", help="Boundary-layer (single)")
+    bl_single.add_argument("--root", required=True)
+    bl_single.add_argument("--edge-method",
+                        choices=["edge_velocity","vorticity_threshold","gradient"],
+                        default="vorticity_threshold")
+    bl_single.add_argument("--plot-lm-mach", action="store_true")
+    bl_single.add_argument("--x-locs", nargs="+", type=float, default=[])
+    bl_single.add_argument("--n-jobs", type=int, default=-1)
+    bl_single.add_argument("--format", default="svg")
+    bl_single.add_argument("--dpi",    type=int, default=300)
+
+    bl_compare = subparsers.add_parser("bl-compare", help="Boundary-layer (multi)")
+    bl_compare.add_argument("--cases", nargs="+", required=True)
+    bl_compare.add_argument("--edge-method",
+                            choices=["edge_velocity","vorticity_threshold","gradient"],
+                            default="vorticity_threshold")
+    bl_compare.add_argument("--plot-lm-mach", action="store_true")
+    bl_compare.add_argument("--n-jobs", type=int, default=-1)
+    bl_compare.add_argument("--save", default="A")   # reuse your path helper
+    bl_compare.add_argument("--format", default="svg")
+    bl_compare.add_argument("--dpi", type=int, default=300)
+
+    args = parser.parse_args()
+    if args.command == "single":
+        single_main(args)
+    elif args.command == "compare-surface":
+        compare_surface_main(args)
+    elif args.command == "bl-single":
+        bl_single_main(args)
+    elif args.command == "bl-compare":
+        bl_compare_main(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
