@@ -1,4 +1,6 @@
 import os
+from pathlib import Path
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
@@ -8,6 +10,8 @@ from scipy.spatial import KDTree
 from scipy.signal import savgol_filter  # Import Savitzky-Golay filter
 from joblib import Parallel, delayed
 from collections import defaultdict
+from su2_postprocess.io.output import save_plot
+
 
 # Set up logging for debugging
 logging.basicConfig(
@@ -282,7 +286,35 @@ class MeshParser:
 
         # Create the output directory if it doesn't exist
         os.makedirs(self.output_dir, exist_ok=True)
+    # ────────────────────────────────────────────────────────────────
+    def _save_fig(self, stem_hint: str | None = None, fmt: str = "svg", dpi: int = 300):
+        """
+        Save the *current* Matplotlib figure in `self.output_dir`.
 
+        • If *stem_hint* is given, use it.  
+        • Otherwise derive one from the figure’s title or auto-number it.
+        """
+        fig = plt.gcf()
+
+        # 1️⃣  choose a stem
+        if stem_hint:
+            stem = stem_hint
+        else:
+            title = fig._suptitle.get_text() if fig._suptitle else ""
+            if not title:            # fallback to Axes title
+                axes = fig.get_axes()
+                if axes and axes[0].get_title():
+                    title = axes[0].get_title()
+            if title:
+                # make a filesystem-safe slug
+                stem = re.sub(r"[^0-9a-zA-Z]+", "_", title).strip("_").lower()
+            else:
+                stem = f"figure_{fig.number:02d}"
+
+        # 2️⃣  save & close
+        save_plot(fig, self.output_dir, stem, format=fmt, dpi=dpi)
+        plt.close(fig)
+    # ────────────────────────────────────────────────────────────────
     def load_data(self):
         try:
             self.surface_data, _, self.surface_nodes, self.surface_elements, self.node_neighbors, self.surface_zone_type = self.parse_data(self.surface_file)
@@ -433,6 +465,7 @@ class MeshParser:
             plt.ylabel('Y Coordinate')
             plt.grid(False)
             plt.gca().set_aspect('equal')
+            self._save_fig()              # stem comes from title slug
             #plt.show()
         except Exception as e:
             logging.error(f"Error plotting debug nodes: {e}")
@@ -479,6 +512,7 @@ class MeshParser:
             plt.grid(False)
             plt.gca().set_aspect('equal')
             plt.legend()
+            self._save_fig()              # stem comes from title slug
             #plt.show()
         except Exception as e:
             logging.error(f"Error plotting surface normals: {e}")
@@ -494,6 +528,7 @@ class MeshParser:
             plt.legend()
             plt.grid(False)
             plt.axis('equal')
+            self._save_fig()              # stem comes from title slug
             #plt.show()
         except Exception as e:
             logging.error(f"Error plotting surface and flow data: {e}")
@@ -589,99 +624,210 @@ class MeshParser:
             logging.error(f"Smoothing failed: {e}")
             return u_normalized  # Return original data if smoothing fails
 
-    def compute_velocity_profiles(self, s_max=0.01, num_points=100, verbose=False, smoothing=True, window_length=11, polyorder=4):
+    # ────────────────────────────────────────────────────────────────
+    def compute_velocity_profiles(
+            self,
+            s_max: float       = 0.01,
+            num_points: int    = 100,
+            *,
+            branch: str        = "both",     #  "suction" | "pressure" | "both"
+            verbose: bool      = False,
+            smoothing: bool    = True,
+            window_length: int = 11,
+            polyorder: int     = 4,
+            max_allowable_dx: float = 0.1,  # tolerance in x/c when searching
+    ):
+        """
+        Extract velocity profiles at every x-location in ``self.x_locations``.
+
+        Parameters
+        ----------
+        branch : {"suction", "pressure", "both"}
+            *suction*  → nodes whose outward normal has **n_y > 0**  
+            *pressure* → nodes whose outward normal has **n_y < 0**  
+            *both*     → take whichever node is x-closest (old behaviour).
+
+            If the requested branch has *no* nodes (e.g. very cambered airfoils
+            where all n_y≥0), the code reverts to the **closest-node** rule and
+            warns once.
+        """
         try:
             if not self.x_locations:
                 print("No x_locations specified for velocity profile extraction.")
                 return
 
-            # Prepare the interpolator
-            points = np.column_stack((self.flow_data['x'], self.flow_data['y']))
-            U = self.flow_data.get('Velocity_x')
-            V = self.flow_data.get('Velocity_y')
-            V_mag = np.sqrt(U**2 + V**2)
-            vel_interpolator = NearestNDInterpolator(points, V_mag)
+            # ── build interpolator of |V| in the volume ─────────────────────────
+            pts   = np.column_stack((self.flow_data['x'], self.flow_data['y']))
+            Vmag  = np.hypot(self.flow_data['Velocity_x'], self.flow_data['Velocity_y'])
+            vel_I = NearestNDInterpolator(pts, Vmag)
 
-            # Create a KDTree for efficient spatial searches
-            kdtree = KDTree(self.surface_nodes[:, :2])
+            # ── decide which surface nodes belong to the requested branch ───────
+            if branch == "suction":
+                pool = np.where(self.surface_normals[:, 1] > 0)[0]
+            elif branch == "pressure":
+                pool = np.where(self.surface_normals[:, 1] < 0)[0]
+            else:                                     # "both"
+                pool = np.arange(len(self.surface_nodes))
 
+            if pool.size == 0 and branch != "both":
+                logging.warning(
+                    f"No nodes found for branch='{branch}'. Falling back to 'both'."
+                )
+                pool = np.arange(len(self.surface_nodes))
+
+            kdtree = KDTree(self.surface_nodes[pool, :2])  # search only within pool
+
+            # ── loop over requested x-stations ───────────────────────────────────
             for x_loc in self.x_locations:
-                # Find the index of the closest surface node to x_loc
-                x_diffs = np.abs(self.surface_nodes[:, 0] - x_loc)
-                closest_idx = np.argmin(x_diffs)
-                min_diff = x_diffs[closest_idx]
-
-                # Define a reasonable maximum allowable difference
-                max_allowable_diff = 0.01  # Adjust based on your mesh resolution
-
-                if min_diff > max_allowable_diff:
+                dist, pool_idx = kdtree.query([x_loc, 0.0])
+                if dist > max_allowable_dx:
                     if verbose:
-                        logging.warning(
-                            f"No surface nodes found within {max_allowable_diff} tolerance for x = {x_loc}. "
-                            f"Nearest node is at x = {self.surface_nodes[closest_idx, 0]:.4f} with difference {min_diff:.6f}."
-                        )
-                    continue  # Skip if the nearest node is too far
-
-                surface_node = self.surface_nodes[closest_idx, :2]
-                normal = self.surface_normals[closest_idx]
-
-                # Retrieve boundary layer thickness and edge velocity for normalization
-                bl_thickness = self.bl_thicknesses.get('vorticity_threshold', [np.nan])[closest_idx]
-                U_e = self.edge_velocities.get('vorticity_threshold', [np.nan])[closest_idx]
-
-                if np.isnan(bl_thickness) or U_e == 0 or np.isnan(U_e):
-                    if verbose:
-                        logging.warning(
-                            f"Invalid BL thickness or edge velocity at x = {x_loc}, node = {closest_idx}."
-                        )
-                    continue  # Skip normalization if data is invalid
-
-                # Adjust s_max for current location to not exceed BL thickness
-                s_max_loc = min(s_max, bl_thickness)
-
-                # Sample points along the normal direction up to s_max_loc
-                s_values = np.linspace(0, s_max_loc, num_points)
-                positions = surface_node + np.outer(s_values, normal)
-
-                # Interpolate velocities at these positions
-                velocities = vel_interpolator(positions)
-
-                # Handle NaNs in velocities
-                valid = ~np.isnan(velocities)
-                s_values = s_values[valid]
-                velocities = velocities[valid]
-
-                if len(s_values) == 0:
-                    if verbose:
-                        logging.warning(
-                            f"No valid velocity data for x = {x_loc}, node = {closest_idx}."
-                        )
+                        logging.warning(f"No surface node within {max_allowable_dx} "
+                                        f"of x={x_loc:.4f}")
                     continue
 
-                # Normalize the profiles
-                s_normalized = s_values / bl_thickness
-                u_normalized = velocities / U_e
+                idx       = pool[pool_idx]              # index on full surface
+                surf_pt   = self.surface_nodes[idx, :2]
+                n_vec     = self.surface_normals[idx]
 
-                # Apply smoothing if enabled
+                δ  = self.bl_thicknesses.get('vorticity_threshold', [np.nan])[idx]
+                Ue = self.edge_velocities .get('vorticity_threshold', [np.nan])[idx]
+
+                if np.isnan(δ) or δ <= 0 or np.isnan(Ue) or Ue == 0:
+                    if verbose:
+                        logging.warning(f"Bad BL data at x={x_loc:.4f} (node {idx})")
+                    continue
+
+                # limit integration length
+                s_vals = np.linspace(0.0, min(s_max, δ), num_points)
+                pts_nd = surf_pt + np.outer(s_vals, n_vec)
+                u_vals = vel_I(pts_nd)
+
+                good = ~np.isnan(u_vals)
+                if not np.any(good):
+                    continue
+
+                s_norm = s_vals[good] / δ
+                u_norm = u_vals[good] / Ue
+
                 if smoothing:
-                    u_normalized = self.smooth_velocity_profile(u_normalized, window_length=window_length, polyorder=polyorder)
-
-                if verbose:
-                    print(
-                        f"Extracted and normalized velocity profile at x = {x_loc:.4f} (node {closest_idx}), "
-                        f"number of points: {len(s_normalized)}"
+                    u_norm = self.smooth_velocity_profile(
+                        u_norm, window_length=window_length, polyorder=polyorder
                     )
 
-                # Store the profile using the actual x-location and node identifier
-                self.velocity_profiles[x_loc].append({
-                    'node_index': closest_idx,
-                    's_normalized': s_normalized,
-                    'u_normalized': u_normalized
-                })
+                # store profile
+                self.velocity_profiles[x_loc].append(
+                    dict(node_index=idx,
+                        branch=branch,
+                        s_normalized=s_norm,
+                        u_normalized=u_norm)
+                )
+
+                if verbose:
+                    print(f"Profile @ x={x_loc:.3f}  node={idx}  "
+                        f"branch={branch:<8}  pts={len(s_norm)}")
 
         except Exception as e:
             logging.error(f"Error computing velocity profiles: {e}")
             raise
+# ────────────────────────────────────────────────────────────────
+
+
+
+
+    # def compute_velocity_profiles(self, s_max=0.01, num_points=100, verbose=False, smoothing=True, window_length=11, polyorder=4):
+    #     try:
+    #         if not self.x_locations:
+    #             print("No x_locations specified for velocity profile extraction.")
+    #             return
+
+    #         # Prepare the interpolator
+    #         points = np.column_stack((self.flow_data['x'], self.flow_data['y']))
+    #         U = self.flow_data.get('Velocity_x')
+    #         V = self.flow_data.get('Velocity_y')
+    #         V_mag = np.sqrt(U**2 + V**2)
+    #         vel_interpolator = NearestNDInterpolator(points, V_mag)
+
+    #         # Create a KDTree for efficient spatial searches
+    #         kdtree = KDTree(self.surface_nodes[:, :2])
+
+    #         for x_loc in self.x_locations:
+    #             # Find the index of the closest surface node to x_loc
+    #             x_diffs = np.abs(self.surface_nodes[:, 0] - x_loc)
+    #             closest_idx = np.argmin(x_diffs)
+    #             min_diff = x_diffs[closest_idx]
+
+    #             # Define a reasonable maximum allowable difference
+    #             max_allowable_diff = 0.01  # Adjust based on your mesh resolution
+
+    #             if min_diff > max_allowable_diff:
+    #                 if verbose:
+    #                     logging.warning(
+    #                         f"No surface nodes found within {max_allowable_diff} tolerance for x = {x_loc}. "
+    #                         f"Nearest node is at x = {self.surface_nodes[closest_idx, 0]:.4f} with difference {min_diff:.6f}."
+    #                     )
+    #                 continue  # Skip if the nearest node is too far
+
+    #             surface_node = self.surface_nodes[closest_idx, :2]
+    #             normal = self.surface_normals[closest_idx]
+
+    #             # Retrieve boundary layer thickness and edge velocity for normalization
+    #             bl_thickness = self.bl_thicknesses.get('vorticity_threshold', [np.nan])[closest_idx]
+    #             U_e = self.edge_velocities.get('vorticity_threshold', [np.nan])[closest_idx]
+
+    #             if np.isnan(bl_thickness) or U_e == 0 or np.isnan(U_e):
+    #                 if verbose:
+    #                     logging.warning(
+    #                         f"Invalid BL thickness or edge velocity at x = {x_loc}, node = {closest_idx}."
+    #                     )
+    #                 continue  # Skip normalization if data is invalid
+
+    #             # Adjust s_max for current location to not exceed BL thickness
+    #             s_max_loc = min(s_max, bl_thickness)
+
+    #             # Sample points along the normal direction up to s_max_loc
+    #             s_values = np.linspace(0, s_max_loc, num_points)
+    #             positions = surface_node + np.outer(s_values, normal)
+
+    #             # Interpolate velocities at these positions
+    #             velocities = vel_interpolator(positions)
+
+    #             # Handle NaNs in velocities
+    #             valid = ~np.isnan(velocities)
+    #             s_values = s_values[valid]
+    #             velocities = velocities[valid]
+
+    #             if len(s_values) == 0:
+    #                 if verbose:
+    #                     logging.warning(
+    #                         f"No valid velocity data for x = {x_loc}, node = {closest_idx}."
+    #                     )
+    #                 continue
+
+    #             # Normalize the profiles
+    #             s_normalized = s_values / bl_thickness
+    #             u_normalized = velocities / U_e
+
+    #             # Apply smoothing if enabled
+    #             if smoothing:
+    #                 u_normalized = self.smooth_velocity_profile(u_normalized, window_length=window_length, polyorder=polyorder)
+
+    #             if verbose:
+    #                 print(
+    #                     f"Extracted and normalized velocity profile at x = {x_loc:.4f} (node {closest_idx}), "
+    #                     f"number of points: {len(s_normalized)}"
+    #                 )
+
+    #             # Store the profile using the actual x-location and node identifier
+    #             self.velocity_profiles[x_loc].append({
+    #                 'node_index': closest_idx,
+    #                 's_normalized': s_normalized,
+    #                 'u_normalized': u_normalized
+    #             })
+
+    #     except Exception as e:
+    #         logging.error(f"Error computing velocity profiles: {e}")
+    #         raise
 
     def plot_velocity_profiles(self):
         try:
@@ -696,14 +842,43 @@ class MeshParser:
                     s_norm = profile['s_normalized']
                     u_norm = profile['u_normalized']
                     plt.plot(u_norm, s_norm,label=f'Node {node_idx}')
-                plt.xlabel('Normalized Velocity (u/u_e)')
-                plt.ylabel('Normalized Distance (s/δ)')
+                plt.xlabel(r"Normalized Velocity ($u/U_e$)")             
+                plt.ylabel(r"Normalized Distance (s/$\delta$)")
                 plt.title(f'Normalized Velocity Profiles at x = {x_loc}')
                 plt.legend()
                 plt.grid(False)
-                #plt.show()
+                self._save_fig()              # stem comes from title slug
+
         except Exception as e:
             logging.error(f"Error plotting velocity profiles: {e}")
+
+    # ────────────────────────────────────────────────────────────────
+    def plot_velocity_profiles_grid(self):
+        """
+        Draw all requested profiles in one figure as subplots laid out
+        roughly at their x/c position.  Good for a “growth-along-chord”
+        visual.
+        """
+        if not self.velocity_profiles:
+            return
+
+        # Sort x-locations from LE → TE
+        xs   = sorted(self.velocity_profiles.keys())
+        ncol = len(xs)
+        fig, axs = plt.subplots(1, ncol, figsize=(2.5*ncol, 4), sharey=True)
+
+        for ax, x_loc in zip(axs, xs):
+            for prof in self.velocity_profiles[x_loc]:
+                ax.plot(prof['u_normalized'], prof['s_normalized'])
+            ax.set_title(f"x/c={x_loc:.2f}")
+            ax.set_xlabel(r"$u/U_e$")
+            ax.grid(False)
+        axs[0].set_ylabel(r"$s/\delta$")
+        fig.suptitle("Boundary-layer growth along chord", fontsize=12)
+        fig.tight_layout(rect=[0,0,1,0.93])
+        self._save_fig("bl_profiles_grid")
+    # ────────────────────────────────────────────────────────────────
+
 
     def plot_boundary_layer_quantities(self):
         try:
@@ -714,7 +889,7 @@ class MeshParser:
             methods = list(self.bl_thicknesses.keys())
 
             # Plot Boundary Layer Thickness vs X Coordinate
-            plt.figure()
+            fig = plt.figure()
             for method in methods:
                 thicknesses = np.asarray(self.bl_thicknesses[method], dtype=float).flatten()
                 thicknesses_smoothed = self.smooth_data(thicknesses, window_size)
@@ -725,6 +900,7 @@ class MeshParser:
             plt.legend()
             plt.grid(False)
             #plt.show()
+            self._save_fig()              # stem comes from title slug
 
             # Plot Displacement Thickness vs X Coordinate
             plt.figure()
@@ -737,6 +913,7 @@ class MeshParser:
             plt.ylabel('Displacement Thickness')
             plt.legend()
             plt.grid(False)
+            self._save_fig()              # stem comes from title slug
             #plt.show()
 
             # Plot Momentum Thickness vs X Coordinate
@@ -750,6 +927,7 @@ class MeshParser:
             plt.ylabel('Momentum Thickness')
             plt.legend()
             plt.grid(False)
+            self._save_fig()              # stem comes from title slug
             #plt.show()
 
             # Plot Shape Factor vs X Coordinate
@@ -763,6 +941,7 @@ class MeshParser:
             plt.ylabel('Shape Factor')
             plt.legend()
             plt.grid(False)
+            self._save_fig()              # stem comes from title slug
             #plt.show()
 
             plt.figure()
@@ -772,6 +951,7 @@ class MeshParser:
             plt.ylabel('BL ALL')
             plt.legend()
             plt.grid(False)
+            self._save_fig()              # stem comes from title slug
 
             # Plot Edge Velocity vs X Coordinate
             plt.figure()
@@ -784,6 +964,7 @@ class MeshParser:
             plt.ylabel('Edge Velocity')
             plt.legend()
             plt.grid(False)
+            self._save_fig()              # stem comes from title slug
             #plt.show()
 
             # Plot Airfoil Surface with Boundary Layer Thickness Overlaid
@@ -806,6 +987,7 @@ class MeshParser:
             plt.legend()
             plt.grid(False)
             plt.axis('equal')
+            self._save_fig()              # stem comes from title slug
             #plt.show()
         except Exception as e:
             logging.error(f"Error plotting boundary layer quantities: {e}")
@@ -877,7 +1059,7 @@ class MeshParser:
         except Exception as e:
             logging.error(f"Error saving velocity profiles to files: {e}")
 
-    def run(self, methods=['edge_velocity', 'vorticity_threshold'], threshold=0.99, max_steps=1e6, step_size=1e-7, tolerance=1e-3, n_jobs=-1, verbose=False):
+    def run(self, methods=['edge_velocity', 'vorticity_threshold'], threshold=0.99, max_steps=1e6, step_size=1e-7, tolerance=1e-3, n_jobs=-1, verbose=False, branch: str    = "both"):
         try:
             self.load_data()
             self.plot_surface_and_flow_data()
@@ -911,6 +1093,7 @@ class MeshParser:
 
             # Compute velocity profiles at specified x_locations with smoothing enabled
             self.compute_velocity_profiles(
+                branch= branch,   #  ◀◀ NEW
                 verbose=verbose,
                 smoothing=True,            # Enable smoothing
                 window_length=13,          # Example window length (must be odd)
@@ -919,6 +1102,7 @@ class MeshParser:
 
             # Plot the velocity profiles
             self.plot_velocity_profiles()
+            self.plot_velocity_profiles_grid()        # NEW
 
             # Save velocity profiles to files
             self.save_velocity_profiles_to_files()
@@ -926,35 +1110,38 @@ class MeshParser:
         except Exception as e:
             logging.error(f"Error running MeshParser: {e}")
             raise
-    def run_bl7(
-        surface_file: str,
-        flow_file: str,
-        output_dir: str,
-        x_locations: list[float],
-        methods: list[str] = ["vorticity_threshold"],
-        threshold: float = 0.99,
-        max_steps: float = 1e6,
-        step_size: float = 1e-7,
-        tolerance: float = 1e-3,
-        n_jobs: int = -1,
-        verbose: bool = False,
-    ):
-        parser = MeshParser(
-            surface_file=surface_file,
-            flow_file=flow_file,
-            output_dir=output_dir,
-            x_locations=x_locations,
-        )
-        parser.run(
-            methods=methods,
-            threshold=threshold,
-            max_steps=max_steps,
-            step_size=step_size,
-            tolerance=tolerance,
-            n_jobs=n_jobs,
-            verbose=verbose,
-        )
-        return parser  # allows post-hook use (e.g., plotting)
+def run_bl7(
+    surface_file: str,
+    flow_file: str,
+    output_dir: str,
+    x_locations: list[float],
+    methods: list[str] = ["vorticity_threshold"],
+    threshold: float = 0.99,
+    max_steps: float = 1e6,
+    step_size: float = 1e-7,
+    tolerance: float = 1e-3,
+    n_jobs: int = -1,
+    branch: str = "both",    # add here too
+    verbose: bool = False,
+):
+    parser = MeshParser(
+        surface_file=surface_file,
+        flow_file=flow_file,
+        output_dir=output_dir,
+        x_locations=x_locations,
+    )
+    parser.run(
+        methods=methods,
+        threshold=threshold,
+        max_steps=max_steps,
+        step_size=step_size,
+        tolerance=tolerance,
+        n_jobs=n_jobs,
+        verbose=verbose,
+        branch     = branch,
+    )
+    # plt.show()      
+    return parser  # allows post-hook use (e.g., plotting)
 # if __name__ == "__main__":
 #     try:
 #         # Define the paths to your data files
@@ -992,4 +1179,3 @@ class MeshParser:
 #     except Exception as e:
 #         print(f"An error occurred: {e}")
 #         print("Check the log file 'mesh_parser_debug.log' for more details.")
-#     plt.show()

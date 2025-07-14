@@ -62,7 +62,7 @@ def single_main(args):
                 continue
 
             df, elems = parse_felineseg_surface(surf_path)
-            df = reorder_surface_nodes_from_elements(df, elems)
+            df, order = reorder_surface_nodes_from_elements(df, elems)
             label_full, meta = extract_case_metadata_fallback(force_file, return_metadata=True, fields=["turbulence_model", "transition_model", "reynolds", "tu", "mach", "alpha"])
             slug = f"m{meta['mach']:.2f}_re{int(meta['reynolds']/1e6)}e6_aoa{int(round(meta['alpha']))}".lower()
             

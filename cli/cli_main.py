@@ -6,7 +6,7 @@ from su2_postprocess.utils.mesh_comparator import MeshParser, compare_bl_dataset
 from su2_postprocess.cli.single_main         import single_main
 from su2_postprocess.cli.compare_surface_main import compare_surface_main
 from su2_postprocess.utils.mesh_comparator import (MeshParser, run_vort, compare_bl_datasets)
-# from su2_postprocess.utils.bl7_meshparser import run_bl7
+from su2_postprocess.utils.bl7_meshparser import run_bl7
 
 
 def main():

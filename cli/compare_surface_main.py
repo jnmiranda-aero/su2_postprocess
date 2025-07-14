@@ -89,7 +89,7 @@ def compare_surface_main(args):
             continue
 
         df, elems = parse_felineseg_surface(surf)
-        df = reorder_surface_nodes_from_elements(df, elems)
+        df, order = reorder_surface_nodes_from_elements(df, elems)
 
         label_full, meta = extract_case_metadata_fallback(force, return_metadata=True)
         slug = f"m{meta['mach']:.2f}_re{int(meta['reynolds']/1e6)}e6_aoa{int(round(meta['alpha']))}".lower()
@@ -105,11 +105,11 @@ def compare_surface_main(args):
         msescf_list.append(lookup(msescf, slug))
         ecp_list.append(lookup(exp_cp, slug))
         ecf_list.append(lookup(exp_cf, slug))
-        labels.append(legend_label(meta, args.label_style, case.name, len(labels)+1))
-        meta_texts.append(flow_metadata_text(meta))
+        # labels.append(legend_label(meta, args.label_style, case.name, len(labels)+1))
+        # meta_texts.append(flow_metadata_text(meta))
 
-        dfs.append(df)
-        forces_paths.append(force)
+        # dfs.append(df)
+        # forces_paths.append(force)
 
         # xcp_list.append(pick(xcp,  "cp", slug))
         # xcf_list.append(pick(xcf,  "cf", slug))

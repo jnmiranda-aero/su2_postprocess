@@ -1,6 +1,9 @@
 #reorder.py
+from __future__ import annotations
 import numpy as np
 import pandas as pd
+from typing import List, Tuple
+from scipy.spatial import KDTree
 
 def reorder_surface_nodes_from_elements(df, elements, zone_type='FELINESEG'):
     """
@@ -41,5 +44,16 @@ def reorder_surface_nodes_from_elements(df, elements, zone_type='FELINESEG'):
             break  # Stop early if stuck
 
     reordered_df = df.iloc[ordered_nodes].reset_index(drop=True)
-    return reordered_df
+    return reordered_df, ordered_nodes
 
+def reorder_volume_nodes_to_surface(
+    volume_nodes: np.ndarray,
+    surface_xy_ordered: np.ndarray,
+) -> np.ndarray:
+    """
+    Match each *ordered* surface node to the nearest (x, y) in the volume cloud
+    and return the volume nodes in that same order.
+    """
+    kdtree = KDTree(volume_nodes[:, :2])
+    _, idx = kdtree.query(surface_xy_ordered[:, :2])   # vectorised N×2 query
+    return volume_nodes[idx]
