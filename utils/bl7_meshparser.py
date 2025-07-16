@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import logging
 from scipy.optimize import brentq
 from scipy.interpolate import NearestNDInterpolator
+from scipy.interpolate import CloughTocher2DInterpolator, LinearNDInterpolator
 from scipy.spatial import KDTree
 from scipy.signal import savgol_filter  # Import Savitzky-Golay filter
 from joblib import Parallel, delayed
@@ -259,6 +260,19 @@ def compute_bl_thickness_for_node(args):
         logging.error(f"Error processing node {i}: {e}")
         # Return default values or handle the error as needed
         return (i, {}, {}, {}, {}, {})
+    
+# ────────────────────────────────────────────────────────────────
+def _build_velocity_interpolator(x, y, V):
+    """Return the smoothest SciPy scattered-data interpolator that works."""
+    pts = np.column_stack((x, y))
+    try:
+        return CloughTocher2DInterpolator(pts, V)    # C¹ smooth
+    except Exception:
+        try:
+            return LinearNDInterpolator(pts, V)      # C⁰ smooth
+        except Exception:
+            return NearestNDInterpolator(pts, V)     # piece-wise constant   
+# ────────────────────────────────────────────────────────────────                
 
 class MeshParser:
     def __init__(self, surface_file, flow_file, output_dir='output', x_locations=None):
@@ -314,7 +328,7 @@ class MeshParser:
         # 2️⃣  save & close
         save_plot(fig, self.output_dir, stem, format=fmt, dpi=dpi)
         plt.close(fig)
-    # ────────────────────────────────────────────────────────────────
+
     def load_data(self):
         try:
             self.surface_data, _, self.surface_nodes, self.surface_elements, self.node_neighbors, self.surface_zone_type = self.parse_data(self.surface_file)
@@ -624,113 +638,218 @@ class MeshParser:
             logging.error(f"Smoothing failed: {e}")
             return u_normalized  # Return original data if smoothing fails
 
-    # ────────────────────────────────────────────────────────────────
     def compute_velocity_profiles(
-            self,
-            s_max: float       = 0.01,
-            num_points: int    = 100,
-            *,
-            branch: str        = "both",     #  "suction" | "pressure" | "both"
-            verbose: bool      = False,
-            smoothing: bool    = True,
-            window_length: int = 11,
-            polyorder: int     = 4,
-            max_allowable_dx: float = 0.1,  # tolerance in x/c when searching
-    ):
-        """
-        Extract velocity profiles at every x-location in ``self.x_locations``.
+                self,
+                s_max: float            = 0.03,
+                num_points: int         = 550,
+                *,
+                branch: str             = "both",   # "suction"|"pressure"|"both"
+                dx_tol: float           = 0.01,     # tolerance in x/c
+                smoothing: bool         = True,
+                window_length: int      = 11,
+                polyorder:   int        = 2,
+                verbose:     bool       = False,
+        ):
+            """
+            Extract velocity profiles at the stations in ``self.x_locations``.
 
-        Parameters
-        ----------
-        branch : {"suction", "pressure", "both"}
-            *suction*  → nodes whose outward normal has **n_y > 0**  
-            *pressure* → nodes whose outward normal has **n_y < 0**  
-            *both*     → take whichever node is x-closest (old behaviour).
+            Suction / pressure side is decided from the sign of the *outward*
+            surface-normal **nᵧ**:
 
-            If the requested branch has *no* nodes (e.g. very cambered airfoils
-            where all n_y≥0), the code reverts to the **closest-node** rule and
-            warns once.
-        """
-        try:
+                nᵧ > 0  → suction (upper)  
+                nᵧ < 0  → pressure (lower)
+
+            With ``branch="both"`` the function tries to fetch **one node per side**
+            inside ±``dx_tol`` of every requested *x_loc*.
+            """
             if not self.x_locations:
                 print("No x_locations specified for velocity profile extraction.")
                 return
 
-            # ── build interpolator of |V| in the volume ─────────────────────────
+            # --- build |V| interpolator in the volume -----------------------------
             pts   = np.column_stack((self.flow_data['x'], self.flow_data['y']))
-            Vmag  = np.hypot(self.flow_data['Velocity_x'], self.flow_data['Velocity_y'])
-            vel_I = NearestNDInterpolator(pts, Vmag)
+            Vmag  = np.hypot(self.flow_data['Velocity_x'],
+                            self.flow_data['Velocity_y'])
+            Vint = _build_velocity_interpolator(self.flow_data['x'],
+                                                self.flow_data['y'],
+                                                np.hypot(self.flow_data['Velocity_x'],
+                                                self.flow_data['Velocity_y'])
+        )
 
-            # ── decide which surface nodes belong to the requested branch ───────
-            if branch == "suction":
-                pool = np.where(self.surface_normals[:, 1] > 0)[0]
-            elif branch == "pressure":
-                pool = np.where(self.surface_normals[:, 1] < 0)[0]
-            else:                                     # "both"
-                pool = np.arange(len(self.surface_nodes))
+            # Pre-split surface nodes by side
+            idx_suction   = np.where(self.surface_normals[:, 1] >  0)[0]
+            idx_pressure  = np.where(self.surface_normals[:, 1] <  0)[0]
 
-            if pool.size == 0 and branch != "both":
-                logging.warning(
-                    f"No nodes found for branch='{branch}'. Falling back to 'both'."
-                )
-                pool = np.arange(len(self.surface_nodes))
+            side_map = {
+                "suction":  idx_suction,
+                "pressure": idx_pressure,
+                "both":     np.concatenate((idx_suction, idx_pressure))
+            }
 
-            kdtree = KDTree(self.surface_nodes[pool, :2])  # search only within pool
+            def _closest(idx_pool, x_target):
+                """Return the pool index whose *x* is closest to x_target."""
+                if idx_pool.size == 0:
+                    return None
+                i = idx_pool[np.argmin(np.abs(self.surface_nodes[idx_pool, 0]
+                                            - x_target))]
+                if abs(self.surface_nodes[i, 0] - x_target) <= dx_tol:
+                    return i
+                return None
 
-            # ── loop over requested x-stations ───────────────────────────────────
+            # ---------------------------------------------------------------------
             for x_loc in self.x_locations:
-                dist, pool_idx = kdtree.query([x_loc, 0.0])
-                if dist > max_allowable_dx:
-                    if verbose:
-                        logging.warning(f"No surface node within {max_allowable_dx} "
-                                        f"of x={x_loc:.4f}")
-                    continue
+                wanted_sides = ("suction", "pressure") if branch == "both" else (branch,)
 
-                idx       = pool[pool_idx]              # index on full surface
-                surf_pt   = self.surface_nodes[idx, :2]
-                n_vec     = self.surface_normals[idx]
+                for side in wanted_sides:
+                    i = _closest(side_map[side], x_loc)
+                    if i is None:
+                        if verbose:
+                            logging.warning(f"[{side}] no surface node within "
+                                            f"dx={dx_tol} of x={x_loc:.3f}")
+                        continue
 
-                δ  = self.bl_thicknesses.get('vorticity_threshold', [np.nan])[idx]
-                Ue = self.edge_velocities .get('vorticity_threshold', [np.nan])[idx]
+                    # geometry & reference quantities
+                    x_s, y_s   = self.surface_nodes[i, :2]
+                    n_vec      = self.surface_normals[i]
+                    δ          = self.bl_thicknesses['vorticity_threshold'][i]
+                    Ue         = self.edge_velocities ['vorticity_threshold'][i]
 
-                if np.isnan(δ) or δ <= 0 or np.isnan(Ue) or Ue == 0:
-                    if verbose:
-                        logging.warning(f"Bad BL data at x={x_loc:.4f} (node {idx})")
-                    continue
+                    if np.isnan(δ) or δ <= 0 or np.isnan(Ue) or Ue == 0:
+                        continue
 
-                # limit integration length
-                s_vals = np.linspace(0.0, min(s_max, δ), num_points)
-                pts_nd = surf_pt + np.outer(s_vals, n_vec)
-                u_vals = vel_I(pts_nd)
+                    s_vals = np.linspace(0.0, min(s_max, δ), num_points)
+                    probe  = np.vstack((x_s, y_s)).T + np.outer(s_vals, n_vec)
+                    u_vals = Vint(probe)
 
-                good = ~np.isnan(u_vals)
-                if not np.any(good):
-                    continue
+                    good   = ~np.isnan(u_vals)
+                    if not good.any():
+                        continue
 
-                s_norm = s_vals[good] / δ
-                u_norm = u_vals[good] / Ue
+                    s_norm = s_vals[good] / δ
+                    u_norm = u_vals[good] / Ue
+                    if smoothing:
+                        u_norm = self.smooth_velocity_profile(u_norm,
+                                                            window_length,
+                                                            polyorder)
 
-                if smoothing:
-                    u_norm = self.smooth_velocity_profile(
-                        u_norm, window_length=window_length, polyorder=polyorder
+                    self.velocity_profiles[x_loc].append(
+                        dict(node_index   = i,
+                            branch       = side,
+                            s_normalized = s_norm,
+                            u_normalized = u_norm)
                     )
 
-                # store profile
-                self.velocity_profiles[x_loc].append(
-                    dict(node_index=idx,
-                        branch=branch,
-                        s_normalized=s_norm,
-                        u_normalized=u_norm)
-                )
+                    if verbose:
+                        print(f"Profile @ x={x_loc:.3f} node={i:3d} "
+                            f"side={side:<8} pts={len(s_norm)}")
 
-                if verbose:
-                    print(f"Profile @ x={x_loc:.3f}  node={idx}  "
-                        f"branch={branch:<8}  pts={len(s_norm)}")
+#     # ────────────────────────────────────────────────────────────────
+#     def compute_velocity_profiles(
+#             self,
+#             s_max: float       = 0.01,
+#             num_points: int    = 100,
+#             *,
+#             branch: str        = "both",     #  "suction" | "pressure" | "both"
+#             verbose: bool      = False,
+#             smoothing: bool    = True,
+#             window_length: int = 11,
+#             polyorder: int     = 4,
+#             max_allowable_dx: float = 0.1,  # tolerance in x/c when searching
+#     ):
+#         """
+#         Extract velocity profiles at every x-location in ``self.x_locations``.
 
-        except Exception as e:
-            logging.error(f"Error computing velocity profiles: {e}")
-            raise
-# ────────────────────────────────────────────────────────────────
+#         Parameters
+#         ----------
+#         branch : {"suction", "pressure", "both"}
+#             *suction*  → nodes whose outward normal has **n_y > 0**  
+#             *pressure* → nodes whose outward normal has **n_y < 0**  
+#             *both*     → take whichever node is x-closest (old behaviour).
+
+#             If the requested branch has *no* nodes (e.g. very cambered airfoils
+#             where all n_y≥0), the code reverts to the **closest-node** rule and
+#             warns once.
+#         """
+#         try:
+#             if not self.x_locations:
+#                 print("No x_locations specified for velocity profile extraction.")
+#                 return
+
+#             # ── build interpolator of |V| in the volume ─────────────────────────
+#             pts   = np.column_stack((self.flow_data['x'], self.flow_data['y']))
+#             Vmag  = np.hypot(self.flow_data['Velocity_x'], self.flow_data['Velocity_y'])
+#             vel_I = NearestNDInterpolator(pts, Vmag)
+
+#             # ── decide which surface nodes belong to the requested branch ───────
+#             if branch == "suction":
+#                 pool = np.where(self.surface_normals[:, 1] > 0)[0]
+#             elif branch == "pressure":
+#                 pool = np.where(self.surface_normals[:, 1] < 0)[0]
+#             else:                                     # "both"
+#                 pool = np.arange(len(self.surface_nodes))
+
+#             if pool.size == 0 and branch != "both":
+#                 logging.warning(
+#                     f"No nodes found for branch='{branch}'. Falling back to 'both'."
+#                 )
+#                 pool = np.arange(len(self.surface_nodes))
+
+#             kdtree = KDTree(self.surface_nodes[pool, :2])  # search only within pool
+
+#             # ── loop over requested x-stations ───────────────────────────────────
+#             for x_loc in self.x_locations:
+#                 dist, pool_idx = kdtree.query([x_loc, 0.0])
+#                 if dist > max_allowable_dx:
+#                     if verbose:
+#                         logging.warning(f"No surface node within {max_allowable_dx} "
+#                                         f"of x={x_loc:.4f}")
+#                     continue
+
+#                 idx       = pool[pool_idx]              # index on full surface
+#                 surf_pt   = self.surface_nodes[idx, :2]
+#                 n_vec     = self.surface_normals[idx]
+
+#                 δ  = self.bl_thicknesses.get('vorticity_threshold', [np.nan])[idx]
+#                 Ue = self.edge_velocities .get('vorticity_threshold', [np.nan])[idx]
+
+#                 if np.isnan(δ) or δ <= 0 or np.isnan(Ue) or Ue == 0:
+#                     if verbose:
+#                         logging.warning(f"Bad BL data at x={x_loc:.4f} (node {idx})")
+#                     continue
+
+#                 # limit integration length
+#                 s_vals = np.linspace(0.0, min(s_max, δ), num_points)
+#                 pts_nd = surf_pt + np.outer(s_vals, n_vec)
+#                 u_vals = vel_I(pts_nd)
+
+#                 good = ~np.isnan(u_vals)
+#                 if not np.any(good):
+#                     continue
+
+#                 s_norm = s_vals[good] / δ
+#                 u_norm = u_vals[good] / Ue
+
+#                 if smoothing:
+#                     u_norm = self.smooth_velocity_profile(
+#                         u_norm, window_length=window_length, polyorder=polyorder
+#                     )
+
+#                 # store profile
+#                 self.velocity_profiles[x_loc].append(
+#                     dict(node_index=idx,
+#                         branch=branch,
+#                         s_normalized=s_norm,
+#                         u_normalized=u_norm)
+#                 )
+
+#                 if verbose:
+#                     print(f"Profile @ x={x_loc:.3f}  node={idx}  "
+#                         f"branch={branch:<8}  pts={len(s_norm)}")
+
+#         except Exception as e:
+#             logging.error(f"Error computing velocity profiles: {e}")
+#             raise
+# # ────────────────────────────────────────────────────────────────
 
 
 
@@ -869,7 +988,7 @@ class MeshParser:
 
         for ax, x_loc in zip(axs, xs):
             for prof in self.velocity_profiles[x_loc]:
-                ax.plot(prof['u_normalized'], prof['s_normalized'])
+                ax.plot(prof['u_normalized'], prof['s_normalized'],'--')
             ax.set_title(f"x/c={x_loc:.2f}")
             ax.set_xlabel(r"$u/U_e$")
             ax.grid(False)
@@ -1096,8 +1215,8 @@ class MeshParser:
                 branch= branch,   #  ◀◀ NEW
                 verbose=verbose,
                 smoothing=True,            # Enable smoothing
-                window_length=13,          # Example window length (must be odd)
-                polyorder=2               # Example polynomial order
+                window_length=11,          # Example window length (must be odd)
+                polyorder=2              # Example polynomial order
             )
 
             # Plot the velocity profiles
