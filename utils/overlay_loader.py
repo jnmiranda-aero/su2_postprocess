@@ -8,11 +8,22 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Core reader
 # ---------------------------------------------------------------------------
-def _read_dat(path: Path) -> pd.DataFrame:
+# def _read_dat(path: Path) -> pd.DataFrame:
+#     """
+#     Read any whitespace‐delimited file, skip comment lines,
+#     take col0 as x, colN as y, coerce both to numeric,
+#     drop rows with NaNs, keep only 0<=x<=1, preserve input order.
+#     """
+def _read_dat(path: Path, ycol: int | None = None) -> pd.DataFrame:
     """
-    Read any whitespace‐delimited file, skip comment lines,
-    take col0 as x, colN as y, coerce both to numeric,
-    drop rows with NaNs, keep only 0<=x<=1, preserve input order.
+    Read any whitespace‑delimited .dat/.txt file.
+
+    Parameters
+    ----------
+    path  : file to read
+    ycol  : (0‑based) column to treat as *y*.  
+            • None → use the **last** column (current behaviour)  
+            • 1    → second column, etc.
     """
     try:
         # 1) Read everything, no usecols
